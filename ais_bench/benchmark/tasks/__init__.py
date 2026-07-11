@@ -5,5 +5,6 @@ from ais_bench.benchmark.tasks.swebench.swebench_infer import SWEBenchInferTask
 from ais_bench.benchmark.tasks.swebench.swebench_eval import SWEBenchEvalTask
 from ais_bench.benchmark.tasks.swebench_pro.swebench_pro_infer import SWEBenchProInferTask
 from ais_bench.benchmark.tasks.swebench_pro.swebench_pro_eval import SWEBenchProEvalTask
+from ais_bench.benchmark.tasks.mcp_atlas import MCPAtlasEvalTask, MCPAtlasInferTask  # noqa: F401
 from ais_bench.benchmark.tasks.vbench_eval import VBenchEvalTask  # noqa: F401
 from ais_bench.benchmark.tasks.oneig import OneIGEvalTask  # noqa: F401

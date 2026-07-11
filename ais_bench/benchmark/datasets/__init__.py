@@ -46,6 +46,7 @@ from ais_bench.benchmark.datasets.custom import *
 from ais_bench.benchmark.datasets.infovqa import *
 from ais_bench.benchmark.datasets.docvqa import *
 from ais_bench.benchmark.datasets.omnidocbench.omnidocbench import *
+from ais_bench.benchmark.datasets.mcp_atlas import *
 from ais_bench.benchmark.datasets.mm_custom import *
 from ais_bench.benchmark.datasets.mmmu import *
 from ais_bench.benchmark.datasets.mmmu_pro import *

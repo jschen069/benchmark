@@ -7,3 +7,4 @@ from ais_bench.benchmark.summarizers.swebench import SWEBenchSummarizer  # noqa:
 from ais_bench.benchmark.summarizers.harbor import HarborSummarizer  # noqa: F401
 from ais_bench.benchmark.summarizers.swebench_pro import SWEBenchProSummarizer  # noqa: F401
 from ais_bench.benchmark.summarizers.oneig import OneIGSummarizer  # noqa: F401
+from ais_bench.benchmark.summarizers.mcp_atlas import MCPAtlasSummarizer  # noqa: F401
