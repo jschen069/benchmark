@@ -5,14 +5,6 @@ calls live MCP tools via subprocess isolation, and saves final answers
 as predictions.  The predictions are later scored by
 :class:`MCPAtlasEvalTask`.
 
-Usage::
-
-    evalscope eval \\
-        --model YOUR_MODEL \\
-        --api-url OPENAI_API_COMPAT_URL \\
-        --api-key EMPTY_TOKEN \\
-        --datasets mcp_atlas \\
-        --limit 10
 """
 
 import argparse
@@ -91,6 +83,12 @@ class MCPAtlasInferTask(BaseTask):
         self.request_timeout = float(args.get("request_timeout", 60.0))
         self.list_tools_timeout = float(args.get("list_tools_timeout", 180.0))
         self.use_system_prompt = bool(args.get("use_system_prompt", False))
+
+        # Model inference config
+        infer_cfg: Dict[str, Any] = self.model_cfg.get("infer_cfg") or {}
+        self._model_temperature = float(infer_cfg.get("temperature", 0.0))
+        self._model_max_tokens = int(infer_cfg.get("max_tokens", 2048))
+        self._model_timeout = int(infer_cfg.get("timeout", 120))
 
         # Internal state
         self._client: Optional[MCPAtlasClient] = None
@@ -418,37 +416,28 @@ class MCPAtlasInferTask(BaseTask):
         tools: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Call the LLM API (OpenAI-compatible chat completions)."""
-        url = self.model_cfg.get(
-            "api_url",
-            self.model_cfg.get("url", "http://localhost:8000/v1"),
-        )
-        api_key = self.model_cfg.get(
-            "api_key", self.model_cfg.get("key", "EMPTY"),
-        )
+        url = self.model_cfg.get("api_url", self.model_cfg.get("url", ""))
+        api_key = self.model_cfg.get("api_key", self.model_cfg.get("key", ""))
+        model = self.model_cfg.get("model", self.model_cfg.get("abbr", ""))
 
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
         payload: Dict[str, Any] = {
-            "model": self.model_cfg.get(
-                "model", self.model_cfg.get("abbr", "")
-            ),
+            "model": model,
             "messages": messages,
-            "temperature": self.model_cfg.get("temperature", 0.0),
-            "max_tokens": self.model_cfg.get(
-                "max_out_len", self.model_cfg.get("max_tokens", 2048),
-            ),
+            "temperature": self._model_temperature,
+            "max_tokens": self._model_max_tokens,
         }
         if tools:
             payload["tools"] = tools
 
-        timeout = self.model_cfg.get("timeout", 120)
         resp = requests.post(
             f'{url.rstrip("/")}/chat/completions',
             headers=headers,
             json=payload,
-            timeout=timeout,
+            timeout=self._model_timeout,
         )
         resp.raise_for_status()
         return resp.json()

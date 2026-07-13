@@ -6,14 +6,6 @@ LLM judge on a per-claim basis, and computes aggregated metrics
 :meth:`MCPAtlasAdapter.llm_match_score` and
 :meth:`MCPAtlasAdapter.aggregate_scores` patterns.
 
-Usage::
-
-    evalscope eval \\
-        --model YOUR_MODEL \\
-        --api-url OPENAI_API_COMPAT_URL \\
-        --api-key EMPTY_TOKEN \\
-        --datasets mcp_atlas \\
-        --limit 10
 """
 
 import argparse
@@ -46,7 +38,6 @@ from .utils import (
     _extract_claims,
     _field,
     _parse_claim_judge_response,
-    _parse_enabled_tools,
 )
 
 
@@ -76,10 +67,14 @@ class MCPAtlasEvalTask(BaseTask):
 
         self.pass_threshold = float(args.get("pass_threshold", 0.75))
 
-        # LLM judge configuration
-        self.judge_model = self.model_cfg.get("judge_model")
-        self.judge_api_url = self.model_cfg.get("judge_api_url", "")
-        self.judge_api_key = self.model_cfg.get("judge_api_key", "EMPTY")
+        # LLM judge configuration (all fields from config, with fallback to main model)
+        judge_cfg: Dict[str, Any] = self.model_cfg.get("judge_model") or {}
+        self._judge_model = judge_cfg.get("model", "")
+        self._judge_api_url = judge_cfg.get("api_url", "")
+        self._judge_api_key = judge_cfg.get("api_key", "")
+        self._judge_temperature = float(judge_cfg.get("temperature", 0.0))
+        self._judge_max_tokens = int(judge_cfg.get("max_tokens", 512))
+        self._judge_timeout = int(judge_cfg.get("timeout", 120))
 
     # -- BaseTask interface ------------------------------------------------
 
@@ -288,15 +283,16 @@ class MCPAtlasEvalTask(BaseTask):
         """Call the judge model via OpenAI-compatible API.
 
         Follows evalscope's :class:`LLMJudge.judge` pattern.
+        All parameters come from the judge_model config dict,
+        falling back to the main model config.
         """
-        url = self.judge_api_url or self.model_cfg.get(
-            "api_url",
-            self.model_cfg.get("url", "http://localhost:8000/v1"),
+        url = self._judge_api_url or self.model_cfg.get(
+            "api_url", self.model_cfg.get("url", ""),
         )
-        api_key = self.judge_api_key or self.model_cfg.get(
-            "api_key", self.model_cfg.get("key", "EMPTY"),
+        api_key = self._judge_api_key or self.model_cfg.get(
+            "api_key", self.model_cfg.get("key", ""),
         )
-        judge_model = self.judge_model or self.model_cfg.get(
+        model = self._judge_model or self.model_cfg.get(
             "model", self.model_cfg.get("abbr", ""),
         )
 
@@ -305,17 +301,16 @@ class MCPAtlasEvalTask(BaseTask):
             "Authorization": f"Bearer {api_key}",
         }
         payload = {
-            "model": judge_model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0,
-            "max_tokens": 512,
+            "temperature": self._judge_temperature,
+            "max_tokens": self._judge_max_tokens,
         }
-        timeout = self.model_cfg.get("timeout", 120)
         resp = requests.post(
             f'{url.rstrip("/")}/chat/completions',
             headers=headers,
             json=payload,
-            timeout=timeout,
+            timeout=self._judge_timeout,
         )
         resp.raise_for_status()
         data = resp.json()

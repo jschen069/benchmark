@@ -5,14 +5,6 @@ real Model Context Protocol (MCP) servers.  This module provides a dataset
 loader that reads the ``ScaleAI/MCP-Atlas`` dataset from HuggingFace Hub or
 a local parquet file.
 
-Usage::
-
-    evalscope eval \\
-        --model YOUR_MODEL \\
-        --api-url OPENAI_API_COMPAT_URL \\
-        --api-key EMPTY_TOKEN \\
-        --datasets mcp_atlas \\
-        --limit 10
 """
 
 import os.path as osp

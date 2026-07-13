@@ -1,7 +1,9 @@
-"""MCP-Atlas inference config.
+"""MCP-Atlas benchmark config.
 
-Runs the agent loop against the MCP-Atlas agent-environment Docker service
-and saves predictions.  Run this BEFORE ``mcp_atlas_eval.py``.
+MCP-Atlas evaluates tool-use competency against real Model Context Protocol
+(MCP) servers.  This config runs both inference (agent loop with
+subprocess-isolated MCP tool calls) and evaluation (LLM judge per-claim
+scoring) in one pipeline, following the swebench config pattern.
 
 Pre-requisites
 --------------
@@ -14,24 +16,13 @@ Pre-requisites
 2. Ensure the service is reachable at ``http://localhost:1984`` (or update
    ``mcp_server_url`` below).
 
-Usage
------
-.. code-block:: bash
-
-    evalscope eval \\
-        --model YOUR_MODEL \\
-        --api-url http://127.0.0.1:8000/v1 \\
-        --api-key EMPTY \\
-        --datasets mcp_atlas \\
-        --limit 10
 """
 
 from ais_bench.benchmark.datasets import MCPAtlasDataset
 from ais_bench.benchmark.partitioners import NaivePartitioner
 from ais_bench.benchmark.runners import LocalRunner
 from ais_bench.benchmark.summarizers import MCPAtlasSummarizer
-from ais_bench.benchmark.tasks.base import EmptyTask
-from ais_bench.benchmark.tasks import MCPAtlasInferTask
+from ais_bench.benchmark.tasks import MCPAtlasInferTask, MCPAtlasEvalTask
 
 # ---------------------------------------------------------------------------
 # Model configuration
@@ -41,11 +32,23 @@ models = [
     dict(
         abbr="mcp_atlas_model",
         api_key="EMPTY",
-        url="http://127.0.0.1:8000/v1",
+        url="http://127.0.0.1:8005/v1",
         model="",                        # Fill in your model name
-        temperature=0.0,
-        max_tokens=4096,
-        timeout=300,
+        # ---- Model inference config (for agent loop API calls) -----------
+        infer_cfg=dict(
+            temperature=0.0,
+            max_tokens=32768,
+            timeout=300,
+        ),
+        # ---- LLM judge config (optional; defaults to main model above) ---
+        judge_model=dict(
+            model="",
+            api_key="",
+            api_url="http://127.0.0.1:8005/v1",
+            temperature=0.0,
+            max_tokens=32768,
+            timeout=120,
+        ),
     ),
 ]
 
@@ -109,13 +112,13 @@ infer = dict(
 )
 
 # ---------------------------------------------------------------------------
-# Evaluation (no-op during infer; use mcp_atlas_eval.py for scoring)
+# Evaluation
 # ---------------------------------------------------------------------------
 
 eval = dict(
     partitioner=dict(type=NaivePartitioner),
     runner=dict(
         type=LocalRunner,
-        task=dict(type=EmptyTask),
+        task=dict(type=MCPAtlasEvalTask),
     ),
 )
