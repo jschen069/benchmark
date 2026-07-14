@@ -30,7 +30,7 @@ from ais_bench.benchmark.utils.core.abbr import (
 )
 from ais_bench.benchmark.utils.logging import AISLogger
 
-from .utils import (
+from ais_bench.benchmark.tasks.mcp_atlas.utils import (
     DATASET_ID,
     DEFAULT_MCP_SERVER_URL,
     DEFAULT_SYSTEM_PROMPT,

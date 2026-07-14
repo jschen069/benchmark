@@ -32,7 +32,7 @@ from ais_bench.benchmark.utils.core.abbr import (
 )
 from ais_bench.benchmark.utils.logging import AISLogger
 
-from .utils import (
+from ais_bench.benchmark.tasks.mcp_atlas.utils import (
     DATASET_ID,
     _claim_judge_prompt,
     _extract_claims,
