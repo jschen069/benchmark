@@ -83,7 +83,25 @@ class MCPAtlasDataset(BaseDataset):
             )
 
         logger.info("Loading MCP-Atlas from local parquet: %s", parquet_path)
-        dataset = Dataset.from_parquet(parquet_path)
+        try:
+            dataset = Dataset.from_parquet(parquet_path)
+        except Exception as exc:
+            logger.warning(
+                "Direct parquet read failed (%s), falling back to "
+                "pyarrow read_table + Dataset.from_arrow...",
+                exc,
+            )
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(parquet_path)
+            # Convert Arrow table to dict-of-lists to avoid schema
+            # compatibility issues with dictionary-encoded columns.
+            columns = table.column_names
+            data: Dict[str, Any] = {
+                col: table.column(col).to_pylist() for col in columns
+            }
+            dataset = Dataset.from_dict(data)
+
         logger.info(
             "MCP-Atlas dataset loaded: %d samples, columns=%s",
             len(dataset),
