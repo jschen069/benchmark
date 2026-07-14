@@ -2,24 +2,20 @@
 
 MCP-Atlas is a Scale AI benchmark for evaluating tool-use competency with
 real Model Context Protocol (MCP) servers.  This module provides a dataset
-loader that reads the ``ScaleAI/MCP-Atlas`` dataset from HuggingFace Hub or
-a local parquet file.
+loader that reads the MCP-Atlas parquet file from a local path.
 
 """
 
 import os.path as osp
 from typing import Any, Dict, Optional
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 
 from ais_bench.benchmark.datasets.utils.datasets import get_data_path
 from ais_bench.benchmark.registry import LOAD_DATASET
 from ais_bench.benchmark.utils.logging.logger import AISLogger
 
 from .base import BaseDataset
-
-DATASET_ID = "ScaleAI/MCP-Atlas"
-"""Default HuggingFace dataset identifier."""
 
 logger = AISLogger()
 
@@ -28,65 +24,69 @@ logger = AISLogger()
 class MCPAtlasDataset(BaseDataset):
     """Dataset loader for MCP-Atlas.
 
-    Loads the benchmark from HuggingFace Hub (``ScaleAI/MCP-Atlas``) by
-    default.  Set ``path`` to a local directory containing
-    ``MCP-Atlas.parquet`` to load from disk instead.
+    Loads the benchmark from a local parquet file.  The parquet must
+    contain columns: ``TASK``, ``ENABLED_TOOLS``, ``PROMPT``,
+    ``GTFA_CLAIMS``, ``TRAJECTORY``.
 
     Parameters
     ----------
     path :
-        Local directory or HuggingFace dataset id.  When omitted the
-        default HuggingFace dataset is used.
+        **Required.**  Path to the local ``MCP-Atlas.parquet`` file or
+        a directory containing it.
     split :
-        Which split to load.  Defaults to ``"train"`` (the only split
-        provided by MCP-Atlas).
+        Which split to access.  Defaults to ``"train"``.
     """
+
+    def __init__(
+        self,
+        reader_cfg: Optional[Dict] = None,
+        k: Any = 1,
+        n: Any = 1,
+        **kwargs,
+    ) -> None:
+        # Provide minimal reader_cfg so DatasetReader can initialise
+        # without requiring input_columns / output_column (MCP-Atlas
+        # does not use the ICL reader infrastructure).
+        if reader_cfg is None:
+            reader_cfg = dict(input_columns=[], output_column=None)
+        super().__init__(reader_cfg=reader_cfg, k=k, n=n, **kwargs)
 
     @staticmethod
     def load(
-        path: Optional[str] = None,
+        path: str,
         split: str = "train",
         **kwargs,
     ) -> Dataset:
-        """Load the MCP-Atlas dataset.
+        """Load the MCP-Atlas dataset from a local parquet file.
 
         Returns a :class:`~datasets.Dataset` with columns:
         ``TASK``, ``ENABLED_TOOLS``, ``PROMPT``, ``GTFA_CLAIMS``,
         ``TRAJECTORY``.
         """
-        if path is not None:
-            resolved = get_data_path(path, local_mode=True)
-            # If the resolved path is a directory containing a parquet file
-            # use it directly; otherwise treat it as a HuggingFace dataset id.
-            if osp.isdir(resolved):
-                parquet_path = osp.join(resolved, "MCP-Atlas.parquet")
-                if osp.isfile(parquet_path):
-                    logger.info(
-                        "Loading MCP-Atlas from local parquet: %s",
-                        parquet_path,
-                    )
-                    return Dataset.from_parquet(parquet_path)
-                # Fallback: try loading as a HuggingFace dataset directory
-                logger.info(
-                    "Loading MCP-Atlas from local directory: %s",
-                    resolved,
-                )
-                try:
-                    return load_dataset(
-                        "parquet",
-                        data_files={"train": osp.join(resolved, "*.parquet")},
-                        split=split,
-                        **kwargs,
-                    )
-                except Exception:
-                    pass
-            # Treat as HuggingFace dataset id
-            logger.info(
-                "Loading MCP-Atlas from HuggingFace: %s", resolved
-            )
-            return load_dataset(resolved, split=split, **kwargs)
+        resolved = get_data_path(path, local_mode=True)
+        logger.info("MCP-Atlas dataset path resolved: %s -> %s", path, resolved)
 
+        # Resolve the parquet file path
+        if osp.isdir(resolved):
+            parquet_path = osp.join(resolved, "MCP-Atlas.parquet")
+            if not osp.isfile(parquet_path):
+                raise FileNotFoundError(
+                    f"MCP-Atlas parquet not found in directory: {resolved}. "
+                    "Expected MCP-Atlas.parquet inside the directory."
+                )
+        elif osp.isfile(resolved):
+            parquet_path = resolved
+        else:
+            raise FileNotFoundError(
+                f"MCP-Atlas dataset not found at: {resolved}. "
+                "Provide a valid path to the MCP-Atlas.parquet file."
+            )
+
+        logger.info("Loading MCP-Atlas from local parquet: %s", parquet_path)
+        dataset = Dataset.from_parquet(parquet_path)
         logger.info(
-            "Loading MCP-Atlas from HuggingFace: %s", DATASET_ID
+            "MCP-Atlas dataset loaded: %d samples, columns=%s",
+            len(dataset),
+            list(dataset.features.keys()),
         )
-        return load_dataset(DATASET_ID, split=split, **kwargs)
+        return dataset

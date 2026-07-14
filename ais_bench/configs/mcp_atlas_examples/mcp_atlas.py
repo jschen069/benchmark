@@ -60,7 +60,7 @@ datasets = [
     dict(
         type=MCPAtlasDataset,
         abbr="mcp_atlas",
-        path="ais_bench/datasets/mcp-atlas/MCP-Atlas.parquet",
+        path="ais_bench/datasets/mcp_atlas/MCP-Atlas.parquet",
         split="train",
         args=dict(
             # MCP agent-environment service URL

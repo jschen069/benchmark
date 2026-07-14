@@ -19,7 +19,6 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-DATASET_ID = "ScaleAI/MCP-Atlas"
 DEFAULT_MCP_SERVER_URL = "http://localhost:1984"
 DEFAULT_SYSTEM_PROMPT = (
     "Role: You are a factual, tool-aware assistant connected to a variety "

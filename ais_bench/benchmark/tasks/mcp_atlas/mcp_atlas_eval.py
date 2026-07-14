@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from ais_bench.benchmark.registry import TASKS
 from ais_bench.benchmark.tasks.base import BaseTask, TaskStateManager
+from ais_bench.benchmark.utils.config.build import build_dataset_from_cfg
 from ais_bench.benchmark.utils.core.abbr import (
     dataset_abbr_from_cfg,
     get_infer_output_path,
@@ -33,7 +34,6 @@ from ais_bench.benchmark.utils.core.abbr import (
 from ais_bench.benchmark.utils.logging import AISLogger
 
 from ais_bench.benchmark.tasks.mcp_atlas.utils import (
-    DATASET_ID,
     _claim_judge_prompt,
     _extract_claims,
     _field,
@@ -76,6 +76,18 @@ class MCPAtlasEvalTask(BaseTask):
         self._judge_max_tokens = int(judge_cfg.get("max_tokens", 512))
         self._judge_timeout = int(judge_cfg.get("timeout", 120))
 
+        self.logger.info(
+            "MCPAtlasEvalTask initialized: pass_threshold=%.2f, "
+            "judge_model=%s, judge_api_url=%s, judge_temperature=%.2f, "
+            "judge_max_tokens=%d, judge_timeout=%d",
+            self.pass_threshold,
+            self._judge_model or "(main model fallback)",
+            self._judge_api_url or "(main model fallback)",
+            self._judge_temperature,
+            self._judge_max_tokens,
+            self._judge_timeout,
+        )
+
     # -- BaseTask interface ------------------------------------------------
 
     def get_command(self, cfg_path: str, template: str) -> str:
@@ -94,9 +106,24 @@ class MCPAtlasEvalTask(BaseTask):
             self.logger.warning("No predictions found.")
             self._dump_results([])
             return
+        self.logger.info(
+            "Loaded %d predictions for evaluation", len(predictions)
+        )
 
         # ---- 2. load dataset (for ground-truth claims) --------------------
-        samples = self._load_dataset()
+        dataset_cfg = self.dataset_cfgs[0]
+        self.logger.info(
+            "Loading dataset for ground-truth claims: type=%s abbr=%s path=%s",
+            dataset_cfg.get("type"),
+            dataset_cfg.get("abbr"),
+            dataset_cfg.get("path"),
+        )
+        dataset = build_dataset_from_cfg(dataset_cfg)
+        samples = list(dataset.test)
+        self.logger.info(
+            "Dataset loaded: %d samples with ground-truth claims", len(samples)
+        )
+
         sample_map: Dict[str, Dict[str, Any]] = {}
         for s in samples:
             tid = str(_field(s, "TASK", "task", "task_id") or "")
@@ -115,10 +142,20 @@ class MCPAtlasEvalTask(BaseTask):
         pbar = tqdm(total=total, desc="MCP-Atlas eval", unit="sample")
 
         for idx, (task_id, pred) in enumerate(predictions.items()):
+            self.logger.info(
+                "--- Eval %d/%d: task_id=%s ---", idx + 1, total, task_id
+            )
             result = self._evaluate_prediction(task_id, pred, sample_map)
             results.append(result)
             pbar.update(1)
             task_state_manager.update_task_state({"finish_count": idx + 1})
+            self.logger.info(
+                "Eval %s: coverage_score=%.3f, pass=%s, claims=%d",
+                task_id,
+                result["coverage_score"],
+                result["pass"],
+                result["total_claims"],
+            )
 
         pbar.close()
 
@@ -140,12 +177,18 @@ class MCPAtlasEvalTask(BaseTask):
             osp.join(self.work_dir, "predictions"),
             file_extension="json",
         )
+        self.logger.info("Looking for predictions at: %s", pred_path)
+
         if not osp.isfile(pred_path):
             # Try fallback path (matches swebench pattern)
             pred_path_fallback = osp.join(
                 osp.dirname(pred_path),
                 osp.splitext(osp.basename(pred_path))[0],
                 "preds.json",
+            )
+            self.logger.info(
+                "Primary path not found, trying fallback: %s",
+                pred_path_fallback,
             )
             if osp.isfile(pred_path_fallback):
                 pred_path = pred_path_fallback
@@ -158,47 +201,24 @@ class MCPAtlasEvalTask(BaseTask):
 
         with open(pred_path) as f:
             raw_preds = json.load(f)
+
+        self.logger.info(
+            "Predictions file size: %d bytes", osp.getsize(pred_path)
+        )
         if isinstance(raw_preds, dict):
+            self.logger.info(
+                "Parsed predictions as dict with %d entries", len(raw_preds)
+            )
             return raw_preds
         # If it's a list, index by task_id
-        return {
+        indexed = {
             (p.get("task_id") or str(i)): p
             for i, p in enumerate(raw_preds)
         }
-
-    # -- dataset loading ---------------------------------------------------
-
-    def _load_dataset(self) -> List[Dict[str, Any]]:
-        """Load the MCP-Atlas dataset for ground-truth claims."""
-        dataset_cfg = self.dataset_cfgs[0]
-        args = dataset_cfg.get("args", {}) or {}
-        local_path = args.get("local_path", "")
-
-        if local_path:
-            return self._load_from_local(local_path)
-        return self._load_from_hub()
-
-    def _load_from_hub(self) -> List[Dict[str, Any]]:
-        try:
-            from datasets import load_dataset as hf_load
-        except ImportError:
-            raise ImportError(
-                "HuggingFace datasets not installed. "
-                "Install with: pip install datasets"
-            )
-        ds = hf_load(DATASET_ID, split="train")
-        return [dict(row) for row in ds]
-
-    def _load_from_local(self, path: str) -> List[Dict[str, Any]]:
-        import csv
-
-        file_path = osp.join(path, "mcp_atlas.csv")
-        if not osp.exists(file_path):
-            raise FileNotFoundError(
-                f"MCP-Atlas CSV not found at {file_path}"
-            )
-        with open(file_path, "r", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
+        self.logger.info(
+            "Parsed predictions as list, indexed %d entries", len(indexed)
+        )
+        return indexed
 
     # -- per-sample scoring ------------------------------------------------
 
@@ -217,6 +237,16 @@ class MCPAtlasEvalTask(BaseTask):
         final_answer = str(pred.get("final_answer") or "")
         prompt = str(pred.get("prompt") or "")
 
+        self.logger.info(
+            "[Eval:%s] final_answer_len=%d, prompt_len=%d, "
+            "tool_calls=%d, has_claims_in_pred=%s",
+            task_id,
+            len(final_answer),
+            len(prompt),
+            pred.get("tool_calls", 0),
+            bool(pred.get("gtfa_claims")),
+        )
+
         # Try to get claims from prediction metadata first, then from dataset
         claims = list(pred.get("gtfa_claims") or [])
         if not claims and task_id in sample_map:
@@ -224,12 +254,44 @@ class MCPAtlasEvalTask(BaseTask):
             claims = _extract_claims(
                 _field(sample, "GTFA_CLAIMS", "gtfa_claims", "rubrics") or "[]"
             )
+            self.logger.info(
+                "[Eval:%s] Claims loaded from dataset: %d claims",
+                task_id,
+                len(claims),
+            )
+        elif claims:
+            self.logger.info(
+                "[Eval:%s] Claims found in prediction metadata: %d claims",
+                task_id,
+                len(claims),
+            )
+        else:
+            self.logger.warning(
+                "[Eval:%s] No claims found (neither in prediction nor dataset)",
+                task_id,
+            )
 
         # Judge each claim (matching evalscope's _judge_claim loop)
         claim_results: List[Dict[str, Any]] = []
-        for claim in claims:
+        for i, claim in enumerate(claims):
+            self.logger.info(
+                "[Eval:%s] Judging claim %d/%d: '%s...'",
+                task_id,
+                i + 1,
+                len(claims),
+                claim[:100],
+            )
             cr = self._judge_claim(claim, final_answer)
             claim_results.append(cr)
+            self.logger.info(
+                "[Eval:%s] Claim %d result: outcome=%s score=%.1f "
+                "confidence=%.2f",
+                task_id,
+                i + 1,
+                cr["coverage_outcome"],
+                cr["score"],
+                cr["confidence"],
+            )
 
         total_claims = len(claim_results)
         coverage_score = (
@@ -237,6 +299,20 @@ class MCPAtlasEvalTask(BaseTask):
             if total_claims else 0.0
         )
         passed = coverage_score >= self.pass_threshold
+
+        self.logger.info(
+            "[Eval:%s] Scoring done: coverage_score=%.3f (threshold=%.2f), "
+            "pass=%s, claims_total=%d, claims_fulfilled=%d, "
+            "claims_partial=%d, claims_not_fulfilled=%d",
+            task_id,
+            coverage_score,
+            self.pass_threshold,
+            passed,
+            total_claims,
+            sum(1 for cr in claim_results if cr["score"] == 1.0),
+            sum(1 for cr in claim_results if cr["score"] == 0.5),
+            sum(1 for cr in claim_results if cr["score"] == 0.0),
+        )
 
         return {
             "task_id": task_id,
@@ -260,6 +336,13 @@ class MCPAtlasEvalTask(BaseTask):
         map outcome to numeric score.
         """
         prompt = _claim_judge_prompt(claim, response)
+        self.logger.info(
+            "[Judge] Prompt constructed: claim_len=%d, response_len=%d, "
+            "total_prompt_len=%d",
+            len(claim),
+            len(response),
+            len(prompt),
+        )
         judge_response = self._call_judge(prompt)
         outcome, justification, confidence = _parse_claim_judge_response(
             judge_response
@@ -270,10 +353,21 @@ class MCPAtlasEvalTask(BaseTask):
             "partially_fulfilled": 0.5,
             "not_fulfilled": 0.0,
         }
+        score = score_map.get(outcome, 0.0)
+
+        self.logger.info(
+            "[Judge] Result: outcome=%s -> score=%.1f, confidence=%.2f, "
+            "justification_len=%d",
+            outcome,
+            score,
+            confidence,
+            len(justification),
+        )
+
         return {
             "claim": claim,
             "coverage_outcome": outcome,
-            "score": score_map.get(outcome, 0.0),
+            "score": score,
             "justification": justification,
             "confidence": confidence,
             "raw_judge_response": judge_response,
@@ -306,6 +400,14 @@ class MCPAtlasEvalTask(BaseTask):
             "temperature": self._judge_temperature,
             "max_tokens": self._judge_max_tokens,
         }
+
+        self.logger.info(
+            "[Judge] Calling judge API: url=%s, model=%s, prompt_len=%d, "
+            "temperature=%.2f, max_tokens=%d",
+            url, model, len(prompt),
+            self._judge_temperature, self._judge_max_tokens,
+        )
+
         resp = requests.post(
             f'{url.rstrip("/")}/chat/completions',
             headers=headers,
@@ -315,7 +417,20 @@ class MCPAtlasEvalTask(BaseTask):
         resp.raise_for_status()
         data = resp.json()
         choice = (data.get("choices") or [{}])[0]
-        return str(choice.get("message", {}).get("content", "") or "")
+        result = str(choice.get("message", {}).get("content", "") or "")
+
+        usage = data.get("usage", {})
+        self.logger.info(
+            "[Judge] API response: result_len=%d, finish_reason=%s, "
+            "prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
+            len(result),
+            choice.get("finish_reason", "unknown"),
+            usage.get("prompt_tokens", "N/A"),
+            usage.get("completion_tokens", "N/A"),
+            usage.get("total_tokens", "N/A"),
+        )
+
+        return result
 
     # -- results -----------------------------------------------------------
 
@@ -353,11 +468,17 @@ class MCPAtlasEvalTask(BaseTask):
                 for cr in (r.get("claims") or [])
                 if cr.get("score") == 0.5
             )
+            not_covered = sum(
+                1 for r in results
+                for cr in (r.get("claims") or [])
+                if cr.get("score") == 0.0
+            )
         else:
             avg_coverage = 0.0
             pass_rate = 0.0
             fully_covered = 0
             partially_covered = 0
+            not_covered = 0
 
         summary = {
             "total_count": n_samples,
@@ -366,19 +487,42 @@ class MCPAtlasEvalTask(BaseTask):
             "pass_threshold": self.pass_threshold,
             "fully_covered_claims": fully_covered,
             "partially_covered_claims": partially_covered,
+            "not_covered_claims": not_covered,
         }
+
+        self.logger.info(
+            "Evaluation summary: samples=%d, avg_coverage=%.4f, "
+            "pass_rate=%.4f (threshold=%.2f), claims: %d fulfilled, "
+            "%d partial, %d not_fulfilled",
+            n_samples,
+            avg_coverage,
+            pass_rate,
+            self.pass_threshold,
+            fully_covered,
+            partially_covered,
+            not_covered,
+        )
 
         # Write summary
         summary_path = osp.join(out_dir, f"{dataset_abbr}.json")
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
-        self.logger.info("Summary saved to %s", summary_path)
+        self.logger.info(
+            "Summary saved to %s (%d bytes)",
+            summary_path,
+            osp.getsize(summary_path),
+        )
 
         # Write per-task details
         detail_path = osp.join(out_detail_dir, "details.json")
         with open(detail_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        self.logger.info("Details saved to %s", detail_path)
+        self.logger.info(
+            "Details saved to %s (%d samples, %d bytes)",
+            detail_path,
+            len(results),
+            osp.getsize(detail_path),
+        )
 
 
 # ---------------------------------------------------------------------------

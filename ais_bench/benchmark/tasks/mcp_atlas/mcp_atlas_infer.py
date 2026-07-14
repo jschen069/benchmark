@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from ais_bench.benchmark.registry import TASKS
 from ais_bench.benchmark.tasks.base import BaseTask, TaskStateManager
+from ais_bench.benchmark.utils.config.build import build_dataset_from_cfg
 from ais_bench.benchmark.utils.core.abbr import (
     get_infer_output_path,
     model_abbr_from_cfg,
@@ -31,7 +32,6 @@ from ais_bench.benchmark.utils.core.abbr import (
 from ais_bench.benchmark.utils.logging import AISLogger
 
 from ais_bench.benchmark.tasks.mcp_atlas.utils import (
-    DATASET_ID,
     DEFAULT_MCP_SERVER_URL,
     DEFAULT_SYSTEM_PROMPT,
     MCPAtlasClient,
@@ -96,6 +96,22 @@ class MCPAtlasInferTask(BaseTask):
         self._tool_map: Optional[Dict[str, Dict[str, Any]]] = None
         self._excluded_tasks: List[Dict[str, Any]] = []
 
+        self.logger.info(
+            "MCPAtlasInferTask initialized: mcp_server_url=%s, "
+            "filter_enabled_servers=%s, max_steps=%d, max_tool_calls=%d, "
+            "request_timeout=%.1f, use_system_prompt=%s, "
+            "model_temperature=%.2f, model_max_tokens=%d, model_timeout=%d",
+            self.mcp_server_url,
+            self.filter_enabled_servers,
+            self.max_steps,
+            self.max_tool_calls,
+            self.request_timeout,
+            self.use_system_prompt,
+            self._model_temperature,
+            self._model_max_tokens,
+            self._model_timeout,
+        )
+
     # -- properties --------------------------------------------------------
 
     @property
@@ -123,87 +139,24 @@ class MCPAtlasInferTask(BaseTask):
         # ---- 1. preflight -------------------------------------------------
         self._preflight()
 
-        # ---- 2. load dataset ----------------------------------------------
-        data = self._load_dataset()
-        if not data:
-            self.logger.warning("No samples to run inference on.")
-            self._save_predictions({})
-            return
-
-        total = len(data)
-        task_state_manager.update_task_state({
-            "status": "inferencing",
-            "total_count": total,
-            "progress_description": "MCP-Atlas inference",
-            "finish_count": 0,
-        })
-
-        # ---- 3. run agent loop per sample ---------------------------------
-        predictions: Dict[str, Dict[str, Any]] = {}
-        pbar = tqdm(total=total, desc="MCP-Atlas infer", unit="sample")
-
-        for idx, sample in enumerate(data):
-            result = self._run_sample(sample)
-            task_id = result["task_id"]
-            predictions[task_id] = result
-            pbar.update(1)
-            task_state_manager.update_task_state({"finish_count": idx + 1})
-
-        pbar.close()
-
-        # ---- 4. save predictions ------------------------------------------
-        self._save_predictions(predictions)
-
-    # -- preflight ---------------------------------------------------------
-
-    def _preflight(self) -> None:
-        """Fetch enabled servers and tool catalogue from agent-environment."""
-        try:
-            self._enabled_servers = self.client.enabled_servers()
-            self.logger.info("Enabled MCP servers: %s", self._enabled_servers)
-        except Exception as exc:
-            raise RuntimeError(
-                "MCP-Atlas agent-environment is not available. Start the "
-                "Docker service so that "
-                f"{self.mcp_server_url}/enabled-servers is reachable. "
-                f"Original error: {exc}"
-            ) from exc
-
-        try:
-            raw_tools = self.client.list_tools()
-            self._tool_map = {
-                str(t["name"]): t for t in raw_tools if isinstance(t, dict)
-            }
-            self.logger.info("Loaded %d tools.", len(self._tool_map))
-        except Exception as exc:
-            raise RuntimeError(
-                "MCP-Atlas agent-environment tool catalogue is not available. "
-                "Check that the Docker service is running and "
-                f"{self.mcp_server_url}/list-tools is reachable. "
-                f"Original error: {exc}"
-            ) from exc
-
-    # -- dataset loading ---------------------------------------------------
-
-    def _load_dataset(self) -> List[Dict[str, Any]]:
-        """Load and filter the MCP-Atlas dataset.
-
-        Follows evalscope's record_to_sample pattern: extracts key fields
-        from each raw dataset row (TASK, PROMPT, ENABLED_TOOLS,
-        GTFA_CLAIMS, TRAJECTORY) and filters by enabled MCP servers.
-        """
+        # ---- 2. load dataset (swebench pattern) ---------------------------
         dataset_cfg = self.dataset_cfgs[0]
-        args = dataset_cfg.get("args", {}) or {}
-
-        local_path = args.get("local_path", "")
-        limit = self.cfg.get("limit") or args.get("limit")
-
-        if local_path:
-            data = self._load_from_local(local_path)
-        else:
-            data = self._load_from_hub()
+        self.logger.info(
+            "Loading dataset: type=%s abbr=%s path=%s",
+            dataset_cfg.get("type"),
+            dataset_cfg.get("abbr"),
+            dataset_cfg.get("path"),
+        )
+        dataset = build_dataset_from_cfg(dataset_cfg)
+        data = list(dataset.test)
+        self.logger.info(
+            "Dataset loaded: %d raw samples, columns=%s",
+            len(data),
+            list(data[0].keys()) if data else "N/A",
+        )
 
         # Filter by enabled servers (matching evalscope's sample_filter)
+        limit = self.cfg.get("limit") or dataset_cfg.get("args", {}).get("limit")
         if self.filter_enabled_servers and self._enabled_servers:
             enabled_set = set(self._enabled_servers)
             filtered: List[Dict[str, Any]] = []
@@ -224,37 +177,109 @@ class MCPAtlasInferTask(BaseTask):
                         _field(row, "TASK", "task", "task_id"), missing,
                     )
             self.logger.info(
-                "Filtered %d tasks due to missing servers. %d remaining.",
-                len(data) - len(filtered), len(filtered),
+                "Server filter: %d -> %d samples (%d excluded due to missing servers)",
+                len(data), len(filtered), len(data) - len(filtered),
             )
             data = filtered
+        else:
+            self.logger.info(
+                "Server filter skipped (filter_enabled_servers=%s, "
+                "enabled_servers=%s)",
+                self.filter_enabled_servers,
+                self._enabled_servers,
+            )
 
         if limit and limit > 0:
+            self.logger.info("Applying sample limit: %d -> %d", len(data), min(len(data), limit))
             data = data[:limit]
 
-        return data
+        if not data:
+            self.logger.warning("No samples to run inference on.")
+            self._save_predictions({})
+            return
 
-    def _load_from_hub(self) -> List[Dict[str, Any]]:
+        total = len(data)
+        task_state_manager.update_task_state({
+            "status": "inferencing",
+            "total_count": total,
+            "progress_description": "MCP-Atlas inference",
+            "finish_count": 0,
+        })
+
+        # ---- 3. run agent loop per sample ---------------------------------
+        predictions: Dict[str, Dict[str, Any]] = {}
+        pbar = tqdm(total=total, desc="MCP-Atlas infer", unit="sample")
+
+        for idx, sample in enumerate(data):
+            self.logger.info(
+                "--- Sample %d/%d: task_id=%s ---",
+                idx + 1,
+                total,
+                _field(sample, "TASK", "task", "task_id"),
+            )
+            result = self._run_sample(sample)
+            task_id = result["task_id"]
+            predictions[task_id] = result
+            pbar.update(1)
+            task_state_manager.update_task_state({"finish_count": idx + 1})
+            self.logger.info(
+                "Sample %s done: tool_calls=%d, server_failures=%d, "
+                "answer_len=%d",
+                task_id,
+                result.get("tool_calls", 0),
+                len(result.get("server_failures", {})),
+                len(result.get("final_answer", "")),
+            )
+
+        pbar.close()
+
+        # ---- 4. save predictions ------------------------------------------
+        self._save_predictions(predictions)
+
+    # -- preflight ---------------------------------------------------------
+
+    def _preflight(self) -> None:
+        """Fetch enabled servers and tool catalogue from agent-environment."""
+        self.logger.info(
+            "Preflight: fetching enabled servers from %s",
+            self.mcp_server_url,
+        )
         try:
-            from datasets import load_dataset as hf_load
-        except ImportError:
-            raise ImportError(
-                "HuggingFace datasets not installed. "
-                "Install with: pip install datasets"
+            self._enabled_servers = self.client.enabled_servers()
+            self.logger.info(
+                "Enabled MCP servers (%d): %s",
+                len(self._enabled_servers),
+                self._enabled_servers,
             )
-        ds = hf_load(DATASET_ID, split="train")
-        return [dict(row) for row in ds]
+        except Exception as exc:
+            raise RuntimeError(
+                "MCP-Atlas agent-environment is not available. Start the "
+                "Docker service so that "
+                f"{self.mcp_server_url}/enabled-servers is reachable. "
+                f"Original error: {exc}"
+            ) from exc
 
-    def _load_from_local(self, path: str) -> List[Dict[str, Any]]:
-        import csv
-
-        file_path = osp.join(path, "mcp_atlas.csv")
-        if not osp.exists(file_path):
-            raise FileNotFoundError(
-                f"MCP-Atlas CSV not found at {file_path}"
+        self.logger.info(
+            "Preflight: fetching tool catalogue from %s",
+            self.mcp_server_url,
+        )
+        try:
+            raw_tools = self.client.list_tools()
+            self._tool_map = {
+                str(t["name"]): t for t in raw_tools if isinstance(t, dict)
+            }
+            self.logger.info(
+                "Loaded %d tools: %s",
+                len(self._tool_map),
+                sorted(self._tool_map.keys()),
             )
-        with open(file_path, "r", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
+        except Exception as exc:
+            raise RuntimeError(
+                "MCP-Atlas agent-environment tool catalogue is not available. "
+                "Check that the Docker service is running and "
+                f"{self.mcp_server_url}/list-tools is reachable. "
+                f"Original error: {exc}"
+            ) from exc
 
     # -- per-sample inference ----------------------------------------------
 
@@ -274,17 +299,53 @@ class MCPAtlasInferTask(BaseTask):
         )
         trajectory = _field(sample, "TRAJECTORY", "trajectory") or "[]"
 
+        self.logger.info(
+            "[%s] Extracted fields: prompt_len=%d, enabled_tools=%d (%s), "
+            "claims=%d, trajectory_msgs=%d",
+            task_id,
+            len(prompt),
+            len(enabled_tools),
+            enabled_tools,
+            len(claims),
+            len(_maybe_parse_json(trajectory, default=[])) if isinstance(trajectory, str) else 0,
+        )
+
         # Construct prompt following evalscope's pattern
         input_text = prompt
         if self.use_system_prompt:
             input_text = f"{DEFAULT_SYSTEM_PROMPT}\n\n{prompt}"
+            self.logger.info(
+                "[%s] System prompt prepended (total prompt_len=%d)",
+                task_id,
+                len(input_text),
+            )
+        else:
+            self.logger.info(
+                "[%s] System prompt disabled, using raw prompt (len=%d)",
+                task_id,
+                len(input_text),
+            )
 
         # Build tools payload for the model
         tools_payload = self._build_tools_payload(enabled_tools)
+        self.logger.info(
+            "[%s] Built tools payload: %d tools provided to model",
+            task_id,
+            len(tools_payload),
+        )
 
         # Run agent loop
         final_answer, tool_call_count, server_failures = self._agent_loop(
-            input_text, tools_payload, enabled_tools
+            input_text, tools_payload, enabled_tools, task_id,
+        )
+
+        self.logger.info(
+            "[%s] Agent loop finished: final_answer_len=%d, "
+            "tool_call_count=%d, server_failures=%s",
+            task_id,
+            len(final_answer),
+            tool_call_count,
+            list(server_failures.keys()) if server_failures else "none",
         )
 
         return {
@@ -307,11 +368,15 @@ class MCPAtlasInferTask(BaseTask):
     ) -> List[Dict[str, Any]]:
         """Convert tool names to OpenAI-style tool definitions."""
         if not self._tool_map:
+            self.logger.warning("Tool map is empty, no tools available.")
             return []
         tools: List[Dict[str, Any]] = []
         for name in tool_names:
             raw = self._tool_map.get(name)
             if raw is None:
+                self.logger.warning(
+                    "Tool '%s' not found in tool catalogue, skipping.", name
+                )
                 continue
             tools.append(mcp_tool_to_tool_info(raw))
         return tools
@@ -323,6 +388,7 @@ class MCPAtlasInferTask(BaseTask):
         user_prompt: str,
         tools: List[Dict[str, Any]],
         enabled_tools: List[str],
+        task_id: str = "",
     ) -> Tuple[str, int, Dict[str, str]]:
         """Run the agent conversation loop with the MCP-Atlas service.
 
@@ -340,18 +406,54 @@ class MCPAtlasInferTask(BaseTask):
         server_failures: Dict[str, str] = {}
         final_answer = ""
 
-        for _ in range(self.max_steps):
-            response = self._call_model(messages, tools)
+        self.logger.info(
+            "[%s] Agent loop start: max_steps=%d, max_tool_calls=%d, "
+            "tools_available=%d",
+            task_id,
+            self.max_steps,
+            self.max_tool_calls,
+            len(tools),
+        )
+
+        for step in range(self.max_steps):
+            self.logger.info(
+                "[%s] Step %d: calling model (messages=%d, tools=%d)...",
+                task_id,
+                step + 1,
+                len(messages),
+                len(tools) if step == 0 else 0,  # tools only sent on step 0
+            )
+            response = self._call_model(messages, tools if step == 0 else [])
 
             choice = (response.get("choices") or [{}])[0]
             message = choice.get("message", {})
+            finish_reason = choice.get("finish_reason", "unknown")
 
             # Model wants to call a tool
             if message.get("tool_calls"):
+                tool_names_in_msg = [
+                    tc.get("function", {}).get("name", "?")
+                    for tc in message["tool_calls"]
+                ]
+                self.logger.info(
+                    "[%s] Step %d: model requested %d tool call(s): %s "
+                    "(finish_reason=%s)",
+                    task_id,
+                    step + 1,
+                    len(message["tool_calls"]),
+                    tool_names_in_msg,
+                    finish_reason,
+                )
                 messages.append(message)
 
                 for tc in message["tool_calls"]:
                     if tool_call_count >= self.max_tool_calls:
+                        self.logger.warning(
+                            "[%s] Step %d: tool call limit reached (%d)",
+                            task_id,
+                            step + 1,
+                            self.max_tool_calls,
+                        )
                         break
 
                     func = tc.get("function", {})
@@ -362,11 +464,27 @@ class MCPAtlasInferTask(BaseTask):
                     if not isinstance(tool_args, dict):
                         tool_args = {}
 
+                    self.logger.info(
+                        "[%s] Step %d: executing tool '%s' args=%s",
+                        task_id,
+                        step + 1,
+                        tool_name,
+                        json.dumps(tool_args, ensure_ascii=False),
+                    )
+
                     # Short-circuit failed servers (matching evalscope)
                     server = _tool_name_to_server(tool_name)
                     if server in server_failures:
                         result = _server_unavailable_message(
                             server, server_failures[server]
+                        )
+                        self.logger.info(
+                            "[%s] Step %d: server '%s' already failed, "
+                            "short-circuiting tool '%s'",
+                            task_id,
+                            step + 1,
+                            server,
+                            tool_name,
                         )
                     else:
                         try:
@@ -378,10 +496,28 @@ class MCPAtlasInferTask(BaseTask):
                                 timeout=self.request_timeout,
                             )
                             tool_call_count += 1
+                            self.logger.info(
+                                "[%s] Step %d: tool '%s' succeeded "
+                                "(total_calls=%d, result_len=%d)",
+                                task_id,
+                                step + 1,
+                                tool_name,
+                                tool_call_count,
+                                len(result),
+                            )
                         except MCPAtlasServerUnavailable as exc:
                             server_failures[exc.server_name] = exc.message
                             result = _server_unavailable_message(
                                 exc.server_name, exc.message
+                            )
+                            self.logger.warning(
+                                "[%s] Step %d: server '%s' unavailable "
+                                "for tool '%s': %s",
+                                task_id,
+                                step + 1,
+                                exc.server_name,
+                                tool_name,
+                                exc.message[:200],
                             )
 
                     messages.append({
@@ -395,6 +531,10 @@ class MCPAtlasInferTask(BaseTask):
                         "MCP-Atlas tool call limit exceeded "
                         f"({self.max_tool_calls})."
                     )
+                    self.logger.warning(
+                        "[%s] Tool call limit reached, stopping agent loop.",
+                        task_id,
+                    )
                     break
                 continue
 
@@ -402,10 +542,32 @@ class MCPAtlasInferTask(BaseTask):
             final_answer = str(
                 message.get("content", "") or response.get("content", "")
             )
+            self.logger.info(
+                "[%s] Step %d: model returned final answer "
+                "(finish_reason=%s, answer_len=%d)",
+                task_id,
+                step + 1,
+                finish_reason,
+                len(final_answer),
+            )
             break
         else:
             final_answer = final_answer or "Agent loop exceeded max steps."
+            self.logger.warning(
+                "[%s] Agent loop exceeded max_steps=%d, stopping.",
+                task_id,
+                self.max_steps,
+            )
 
+        self.logger.info(
+            "[%s] Agent loop summary: steps=%d, tool_calls=%d, "
+            "server_failures=%d, final_answer_len=%d",
+            task_id,
+            min(step + 1, self.max_steps),
+            tool_call_count,
+            len(server_failures),
+            len(final_answer),
+        )
         return final_answer, tool_call_count, server_failures
 
     # -- model call --------------------------------------------------------
@@ -433,6 +595,13 @@ class MCPAtlasInferTask(BaseTask):
         if tools:
             payload["tools"] = tools
 
+        self.logger.info(
+            "Calling model: url=%s, model=%s, messages=%d, tools=%d, "
+            "temperature=%.2f, max_tokens=%d",
+            url, model, len(messages), len(tools),
+            self._model_temperature, self._model_max_tokens,
+        )
+
         resp = requests.post(
             f'{url.rstrip("/")}/chat/completions',
             headers=headers,
@@ -440,7 +609,20 @@ class MCPAtlasInferTask(BaseTask):
             timeout=self._model_timeout,
         )
         resp.raise_for_status()
-        return resp.json()
+        response_json = resp.json()
+
+        usage = response_json.get("usage", {})
+        choice = (response_json.get("choices") or [{}])[0]
+        self.logger.info(
+            "Model response: finish_reason=%s, prompt_tokens=%s, "
+            "completion_tokens=%s, total_tokens=%s",
+            choice.get("finish_reason", "unknown"),
+            usage.get("prompt_tokens", "N/A"),
+            usage.get("completion_tokens", "N/A"),
+            usage.get("total_tokens", "N/A"),
+        )
+
+        return response_json
 
     # -- save predictions --------------------------------------------------
 
@@ -462,7 +644,12 @@ class MCPAtlasInferTask(BaseTask):
         with open(out_path, "w") as f:
             json.dump(predictions, f, indent=2, ensure_ascii=False)
             f.write("\n")
-        self.logger.info("Predictions saved to %s (%d samples)", out_path, len(predictions))
+        self.logger.info(
+            "Predictions saved to %s (%d samples, %d bytes)",
+            out_path,
+            len(predictions),
+            osp.getsize(out_path) if osp.isfile(out_path) else 0,
+        )
 
 
 # ---------------------------------------------------------------------------
