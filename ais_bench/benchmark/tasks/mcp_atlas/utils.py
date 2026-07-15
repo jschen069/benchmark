@@ -1,17 +1,27 @@
 """Shared utilities for the MCP-Atlas benchmark task.
 
-Mirrors the logic originally in evalscope's
-:file:`benchmarks/mcp_atlas/utils.py`, adapted for aisbench conventions.
+Implements the core logic ported from the upstream mcp-atlas project
+(agent-harness TypeScript + score_claims.py), adapted for aisbench
+conventions.
+
+Key components:
+- MCPAtlasClient: HTTP client for the agent-environment Docker service
+- Prompt construction helpers (system prompt, message building)
+- Tool detection and conversion (MCP tool → OpenAI format)
+- LLM judge prompt and response parsing (claim-coverage scoring)
+- Context window management (compaction, tool output capping)
+- Subprocess-based tool executor for isolation
 """
 
 import ast
 import json
+import math
 import os
 import os.path as osp
 import re
 import subprocess
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -28,6 +38,14 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 MAX_TOOL_ERROR_CHARS = 1000
+
+# Context compaction parameters (ported from mcp-atlas agent-eval.ts)
+COMPACT_KEEP_FULL_TURNS = 2
+COMPACT_TRUNCATE_THRESHOLD = 1500
+
+# LLM retry parameters (ported from mcp-atlas litellm-strategy.ts)
+MAX_LLM_RETRIES = 3
+LLM_RETRY_BASE_DELAY = 10  # seconds
 
 # Tool-name -> server-name special mappings
 _TOOL_SERVER_MAP: Dict[str, str] = {
@@ -53,6 +71,20 @@ class MCPAtlasServerUnavailable(Exception):
         self.server_name = _tool_name_to_server(tool_name)
         self.message = message
         super().__init__(message)
+
+
+class MCPToolCallError(Exception):
+    """Error during a single tool call execution.
+
+    In the mcp-atlas agent loop, tool-call failures are fed back to the
+    model as tool results so the model can recover.  This exception is
+    used internally by the subprocess executor.
+    """
+
+    def __init__(self, tool_name: str, error: str) -> None:
+        self.tool_name = tool_name
+        self.error = error
+        super().__init__(error)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +177,35 @@ class MCPAtlasClient:
 
 
 # ---------------------------------------------------------------------------
+# Prompt construction (ported from mcp-atlas run_eval.py + agent-eval.ts)
+# ---------------------------------------------------------------------------
+
+
+def build_messages(
+    prompt: str,
+    system_prompt: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Build the initial messages list for the agent loop.
+
+    Follows mcp-atlas's pattern: optional system message followed by the
+    user prompt.
+
+    Args:
+        prompt: The task prompt from the dataset.
+        system_prompt: Optional system prompt to prepend.  If ``None`` or
+            empty, only the user message is sent.
+
+    Returns:
+        A list of OpenAI-format message dicts.
+    """
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+# ---------------------------------------------------------------------------
 # Tool info conversion (shared with datasets module)
 # ---------------------------------------------------------------------------
 
@@ -152,9 +213,9 @@ class MCPAtlasClient:
 def mcp_tool_to_tool_info(raw_tool: Dict[str, Any]) -> Dict[str, Any]:
     """Convert a raw MCP tool descriptor into an OpenAI-style tool definition.
 
-    This mirrors ``mcp_tool_to_tool_info`` from evalscope's
-    :file:`benchmarks/mcp_atlas/utils.py`, adapted to return a plain
-    dictionary instead of an evalscope ``ToolInfo``.
+    Ported from mcp-atlas agent-eval.ts ``_transformToolCalls``.
+    Sets ``strict: false`` to match the upstream behavior (mcp-atlas uses
+    ``strict: false`` for broad model compatibility).
 
     Args:
         raw_tool: A dictionary as returned by the MCP-Atlas
@@ -163,7 +224,7 @@ def mcp_tool_to_tool_info(raw_tool: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns:
         An OpenAI-style tool definition dict with ``type``, ``function``
-        (name, description, parameters).
+        (name, description, parameters, strict).
     """
     schema = (
         raw_tool.get("inputSchema")
@@ -179,11 +240,413 @@ def mcp_tool_to_tool_info(raw_tool: Dict[str, Any]) -> Dict[str, Any]:
             "description": str(raw_tool.get("description") or raw_tool["name"]),
             "parameters": {
                 "type": "object",
-                "properties": schema.get("properties", {}),
-                "required": schema.get("required", []),
+                **schema,  # Pass through full schema (matches upstream)
             },
+            "strict": False,  # Match mcp-atlas: strict=False for compatibility
         },
     }
+
+
+def pruned_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply tool-call specific pruning.
+
+    Ported from mcp-atlas agent-eval.ts ``prunedTools``.  Currently only
+    the met-museum image suppression is ported; additional pruners can be
+    added here.
+    """
+    if tool_name == "met-museum_get-museum-object":
+        tool_args = dict(tool_args)
+        tool_args["returnImage"] = False
+    return tool_args
+
+
+# ---------------------------------------------------------------------------
+# Tool call detection (ported from mcp-atlas agent-eval.ts)
+# ---------------------------------------------------------------------------
+
+
+def detect_tool_calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Detect and validate tool calls in an assistant message.
+
+    Ported from mcp-atlas's Zod schema ``AssistantMessageSchema`` which
+    validates:
+    - ``role == "assistant"``
+    - ``tool_calls`` is a non-empty list
+    - Each tool call has ``id``, ``type == "function"``, ``function``
+      with ``name`` and ``arguments``
+
+    Args:
+        message: The assistant message dict from the LLM response.
+
+    Returns:
+        A list of validated tool call dicts.  Returns an empty list if:
+        - The message is not from the assistant
+        - ``tool_calls`` is missing, None, or empty
+        - Tool calls don't have the expected structure
+    """
+    if not message or message.get("role") != "assistant":
+        return []
+
+    tool_calls = message.get("tool_calls")
+    if not tool_calls or not isinstance(tool_calls, list):
+        return []
+
+    validated: List[Dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        # Must have the basic structure expected by mcp-atlas
+        tc_id = tc.get("id")
+        func = tc.get("function")
+        if not tc_id or not isinstance(func, dict):
+            continue
+        name = func.get("name")
+        arguments = func.get("arguments", "{}")
+        if not name:
+            continue
+        validated.append({
+            "id": str(tc_id),
+            "type": "function",
+            "function": {
+                "name": str(name),
+                "arguments": str(arguments) if arguments else "{}",
+            },
+        })
+    return validated
+
+
+def is_tool_call_message(message: Dict[str, Any]) -> bool:
+    """Quick check: does this assistant message contain tool calls?
+
+    A thin wrapper around :func:`detect_tool_calls` for use in conditionals.
+    """
+    return len(detect_tool_calls(message)) > 0
+
+
+# ---------------------------------------------------------------------------
+# Context window management (ported from mcp-atlas agent-eval.ts)
+# ---------------------------------------------------------------------------
+
+
+def cap_tool_content(
+    content: str, cap: int
+) -> str:
+    """Cap tool result content to a maximum number of characters.
+
+    Ported from mcp-atlas agent-eval.ts ``capToolContent``.  When the
+    content exceeds the cap, it is truncated with a note indicating the
+    original size.
+
+    Args:
+        content: The tool result text.
+        cap: Maximum characters to keep.
+
+    Returns:
+        The possibly truncated content string.
+    """
+    if len(content) <= cap:
+        return content
+    truncated = content[:cap]
+    truncated += (
+        f"\n\n[Tool output truncated to {cap} chars. "
+        f"Original was {len(content)} chars.]"
+    )
+    return truncated
+
+
+def compact_messages(
+    messages: List[Dict[str, Any]], current_turn: int
+) -> List[Dict[str, Any]]:
+    """Compact messages by truncating old tool results to reduce context size.
+
+    Ported from mcp-atlas agent-eval.ts ``compactMessages``.  Keeps full
+    tool results for the last ``COMPACT_KEEP_FULL_TURNS`` turns.  Older
+    tool results longer than ``COMPACT_TRUNCATE_THRESHOLD`` characters
+    are truncated.
+
+    A "turn" starts at each assistant message that contains tool_calls.
+
+    Args:
+        messages: The full conversation history.
+        current_turn: The current turn number (1-indexed).
+
+    Returns:
+        A possibly compacted copy of the messages list.
+    """
+    if current_turn <= COMPACT_KEEP_FULL_TURNS:
+        return messages
+
+    # Find turn boundaries: each assistant message with tool_calls starts a new turn
+    turn_starts: List[int] = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            turn_starts.append(i)
+
+    # Determine which turns to truncate (all except the last COMPACT_KEEP_FULL_TURNS)
+    turns_to_truncate = len(turn_starts) - COMPACT_KEEP_FULL_TURNS
+    if turns_to_truncate <= 0:
+        return messages
+
+    truncate_before_idx = turn_starts[turns_to_truncate]
+
+    result: List[Dict[str, Any]] = []
+    for idx, msg in enumerate(messages):
+        if idx >= truncate_before_idx:
+            result.append(msg)
+            continue
+        m = dict(msg)
+        if m.get("role") == "tool":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content_str = "".join(
+                    c.get("text", "") if isinstance(c, dict) else str(c)
+                    for c in content
+                )
+            elif isinstance(content, str):
+                content_str = content
+            else:
+                content_str = str(content)
+
+            if len(content_str) > COMPACT_TRUNCATE_THRESHOLD:
+                truncated_text = content_str[:COMPACT_TRUNCATE_THRESHOLD]
+                truncated_text += (
+                    f"\n\n[Tool call output too large, truncated to "
+                    f"{COMPACT_TRUNCATE_THRESHOLD} chars. "
+                    f"Original was {len(content_str)} chars.]"
+                )
+                m["content"] = truncated_text
+        result.append(m)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LLM retry logic (ported from mcp-atlas litellm-strategy.ts)
+# ---------------------------------------------------------------------------
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    """Check if an exception is a transient error worth retrying.
+
+    Ported from mcp-atlas agent-eval.ts retry logic:
+    - HTTP 500, 502, 503, 429
+    - Connection timeouts
+    """
+    status = getattr(exc, "response", None)
+    if status is not None:
+        if hasattr(status, "status_code"):
+            status_code = status.status_code
+        elif isinstance(status, int):
+            status_code = status
+        else:
+            status_code = None
+    else:
+        status_code = getattr(exc, "status_code", None)
+
+    if status_code in (500, 502, 503, 429):
+        return True
+
+    error_msg = str(exc).lower()
+    if "timeout" in error_msg or "econnaborted" in error_msg:
+        return True
+
+    return False
+
+
+def get_retry_delay(exc: Exception, attempt: int) -> float:
+    """Calculate retry delay in seconds.
+
+    Ported from mcp-atlas litellm-strategy.ts:
+    - 429: exponential backoff, capped at 30s
+    - Timeout: 15s fixed
+    - Other retryable: 10s fixed
+    """
+    status = getattr(exc, "response", None)
+    if status is not None:
+        if hasattr(status, "status_code"):
+            status_code = status.status_code
+        elif isinstance(status, int):
+            status_code = status
+        else:
+            status_code = None
+    else:
+        status_code = getattr(exc, "status_code", None)
+
+    if status_code == 429:
+        return min(2 ** attempt * 5, 30)
+
+    error_msg = str(exc).lower()
+    if "timeout" in error_msg or "econnaborted" in error_msg:
+        return 15.0
+
+    return float(LLM_RETRY_BASE_DELAY)
+
+
+# ---------------------------------------------------------------------------
+# LLM judge prompt (ported from mcp-atlas score_claims.py)
+# ---------------------------------------------------------------------------
+
+
+def _claim_judge_prompt(claim: str, response: str) -> str:
+    """Generate the LLM judge prompt for evaluating a single claim.
+
+    Ported from mcp-atlas score_claims.py ``_get_single_claim_evaluation_prompt``.
+    Includes detailed scoring criteria, numerical comparison guidelines,
+    and structured output format requirements.
+    """
+    return f"""You are evaluating how well a model's response addresses a specific expert-defined claim.
+SCORING CRITERIA:
+- fulfilled: Claim is completely and accurately addressed. The response covers all key details.
+- partially_fulfilled: Claim is partially addressed. The response covers some but not all key details.
+- not_fulfilled: Claim is not addressed. The response does not include any key details.
+NUMERICAL COMPARISON GUIDELINES:
+- For numerical values, use reasonable approximation thresholds:
+  * Exact match NOT required for decimals
+  * Values within 5% of the claimed number are considered matching
+  * For percentages, ±1 percentage points is acceptable
+  * Round to appropriate significant figures based on context
+- Consider the precision appropriate to the domain:
+  * Scientific measurements may need higher precision
+  * General statistics/estimates can have looser matching
+  * Financial figures should match to reasonable business precision (e.g., millions/billions don't need exact cents)
+- If a number is expressed differently but mathematically equivalent (e.g., "0.5" vs "50%" vs "half"), consider it a match
+CLAIM TO EVALUATE:
+{claim}
+MODEL RESPONSE TO ANALYZE:
+{response}
+INSTRUCTIONS:
+1. Determine if the core requirement of the claim is met in the response
+2. Check if all key components from the claim appear substantively in the response
+   - For numerical values, apply the flexible matching guidelines above
+   - Focus on whether the same magnitude and meaning are conveyed
+3. Assign the appropriate coverage_outcome
+4. Provide specific justification referencing what was/wasn't covered
+   - When numbers differ slightly, note if they're within acceptable range
+5. Provide a confidence level (0.0-1.0) for your assessment
+Be rigorous but fair in your assessment. Focus on whether the response conveys the same information as the claim, not on exact numerical precision unless precision is critical to the claim's meaning.
+Return a JSON object with keys: claim_text, coverage_outcome, justification, confidence_level."""
+
+
+def get_claim_evaluation_schema() -> Dict[str, Any]:
+    """Return the JSON schema for structured claim evaluation output.
+
+    Ported from mcp-atlas score_claims.py ``get_single_claim_evaluation_schema``.
+    Used with ``response_format: json_schema`` for models that support it.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "claim_text": {"type": "string"},
+            "coverage_outcome": {
+                "type": "string",
+                "enum": ["fulfilled", "partially_fulfilled", "not_fulfilled"],
+            },
+            "justification": {"type": "string"},
+            "confidence_level": {"type": "number"},
+        },
+        "required": [
+            "claim_text", "coverage_outcome",
+            "justification", "confidence_level",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Claim extraction utilities (ported from mcp-atlas score_claims.py)
+# ---------------------------------------------------------------------------
+
+
+def _clean_claim_text(text: str) -> str:
+    """Clean individual claim text by removing unwanted characters.
+
+    Ported from mcp-atlas score_claims.py ``clean_claim_text``.
+    """
+    text = text.strip()
+    # Remove bullet point markers and numbering
+    text = re.sub(r"^[-*•·◦‣⁃]\s*", "", text)
+    text = re.sub(r"^\d+[.)]\s*", "", text)
+    # Replace Unicode quotes
+    text = text.replace("\u201c", '"')
+    text = re.sub(r"[\u201d\"]", '"', text)
+    text = text.replace("\u2018", "'")
+    text = text.replace("\u2019", "'")
+    # Replace dashes and ellipsis
+    text = text.replace("\u2013", "-")
+    text = text.replace("\u2014", "-")
+    text = text.replace("\u2026", "...")
+    # Clean trailing punctuation and quotes
+    text = re.sub(r'[.\s]*["\']+$', "", text)
+    text = re.sub(r'["\']+\.*$', '', text)
+    return text
+
+def extract_claims(claim_blob: Any) -> List[str]:
+    """Extract and clean individual claims from various input formats.
+
+    Ported from mcp-atlas score_claims.py ``extract_claims``.  Handles
+    lists of strings, JSON-encoded lists, dict objects with ``claim`` key,
+    and multi-line text with various separators.
+
+    Args:
+        claim_blob: A claim representation (list, string, etc.)
+
+    Returns:
+        A list of cleaned claim strings.
+    """
+    if claim_blob is None:
+        return []
+
+    # Already a list
+    if isinstance(claim_blob, list):
+        cleaned_claims: List[str] = []
+        for claim in claim_blob:
+            cleaned = _clean_claim_text(str(claim))
+            if cleaned and len(cleaned) > 3:
+                cleaned_claims.append(cleaned)
+        return cleaned_claims
+
+    # Convert to string
+    if not isinstance(claim_blob, str):
+        claim_blob = str(claim_blob)
+
+    claim_blob = claim_blob.strip()
+    if not claim_blob:
+        return []
+
+    # Try JSON / Python literal parse
+    if claim_blob.startswith("[") and claim_blob.endswith("]"):
+        for parse_fn in (json.loads, ast.literal_eval):
+            try:
+                parsed = parse_fn(claim_blob)
+                if isinstance(parsed, list):
+                    result: List[str] = []
+                    for c in parsed:
+                        if isinstance(c, dict) and "claim" in c:
+                            c = c["claim"]
+                        cleaned = _clean_claim_text(str(c))
+                        if cleaned and len(cleaned) > 3:
+                            result.append(cleaned)
+                    return result
+            except (json.JSONDecodeError, ValueError, SyntaxError):
+                continue
+
+    # Fallback: text splitting
+    separators = ["\n•", "\n-", "\n*", "\n1.", "\n2.", ";", "||"]
+    for sep in separators:
+        if sep in claim_blob:
+            parts = claim_blob.split(sep)
+            claims = []
+            for p in parts:
+                cleaned = _clean_claim_text(p)
+                if cleaned and len(cleaned) > 3:
+                    claims.append(cleaned)
+            if claims:
+                return claims
+
+    # Split by newlines as last resort
+    return [
+        _clean_claim_text(line)
+        for line in claim_blob.strip().splitlines()
+        if _clean_claim_text(line)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -226,56 +689,8 @@ def _parse_enabled_tools(value: Any) -> List[str]:
     return tools
 
 
-def _extract_claims(value: Any) -> List[str]:
-    parsed = _maybe_parse_json(value, default=value)
-    if isinstance(parsed, list):
-        claims: List[str] = []
-        for item in parsed:
-            if isinstance(item, dict) and item.get("claim"):
-                claims.append(str(item["claim"]).strip())
-            elif isinstance(item, str):
-                nested = _maybe_parse_json(item, default=None)
-                if isinstance(nested, list):
-                    claims.extend(_extract_claims(nested))
-                else:
-                    claims.append(item.strip())
-            elif item is not None:
-                claims.append(str(item).strip())
-        return [c for c in claims if c]
-    if not isinstance(parsed, str):
-        return []
-    text = parsed.strip()
-    if not text:
-        return []
-    if "\n" in text:
-        return [
-            _clean_claim_text(line)
-            for line in text.splitlines()
-            if _clean_claim_text(line)
-        ]
-    return [text]
-
-
-def _clean_claim_text(text: str) -> str:
-    cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", text).strip()
-    return cleaned.strip("\"'")
-
-
-def _extract_required_servers(trajectory: Any) -> List[str]:
-    parsed = _maybe_parse_json(trajectory, default=[])
-    if not isinstance(parsed, list):
-        return []
-    servers: set = set()
-    for message in parsed:
-        if not isinstance(message, dict):
-            continue
-        for tc in message.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function") or {}
-            if isinstance(fn, dict) and fn.get("name"):
-                servers.add(_tool_name_to_server(str(fn["name"])))
-    return sorted(servers)
+# Backward-compatible alias
+_extract_claims = extract_claims
 
 
 def _tool_name_to_server(tool_name: str) -> str:
@@ -283,6 +698,13 @@ def _tool_name_to_server(tool_name: str) -> str:
 
 
 def _parse_claim_judge_response(response: Any) -> Tuple[str, str, float]:
+    """Parse the LLM judge response into (outcome, justification, confidence).
+
+    Ported and enhanced from mcp-atlas score_claims.py.  Handles:
+    - Structured JSON output (from json_schema response_format)
+    - JSON wrapped in markdown fences
+    - Free-text fallback with keyword scanning
+    """
     if not isinstance(response, str):
         return "not_fulfilled", "Judge response was not text.", 0.0
     text = _strip_json_fence(response)
@@ -299,6 +721,9 @@ def _parse_claim_judge_response(response: Any) -> Tuple[str, str, float]:
         confidence = _parse_confidence(
             parsed.get("confidence_level", parsed.get("confidence", 0.0))
         )
+        # Validate outcome is one of the three allowed values
+        if outcome not in ("fulfilled", "partially_fulfilled", "not_fulfilled"):
+            outcome = "not_fulfilled"
         return outcome, justification, confidence
     except Exception:
         lowered = text.lower()
@@ -361,20 +786,6 @@ def _server_unavailable_message(server_name: str, message: str) -> str:
     )
 
 
-def _claim_judge_prompt(claim: str, response: str) -> str:
-    return (
-        "You are evaluating how well a model's response addresses a "
-        "specific expert-defined claim. Treat the claim as the authoritative "
-        "reference. Do not use external knowledge to dispute or correct the "
-        "claim. Judge only whether the model response explicitly states, "
-        "entails, or omits the claim. Return JSON with keys: claim_text, "
-        "coverage_outcome, justification, confidence_level. "
-        "coverage_outcome must be one of: fulfilled, partially_fulfilled, "
-        f"not_fulfilled.\n\nCLAIM TO EVALUATE:\n{claim}\n\n"
-        f"MODEL RESPONSE TO ANALYZE:\n{response}"
-    )
-
-
 def _format_tool_response(value: Any) -> str:
     if isinstance(value, list):
         parts: List[str] = []
@@ -409,6 +820,115 @@ def _field(record: Dict[str, Any], *names: str) -> Any:
         if name in record:
             return record[name]
     return None
+
+
+def _extract_required_servers(trajectory: Any) -> List[str]:
+    parsed = _maybe_parse_json(trajectory, default=[])
+    if not isinstance(parsed, list):
+        return []
+    servers: set = set()
+    for message in parsed:
+        if not isinstance(message, dict):
+            continue
+        for tc in message.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            if isinstance(fn, dict) and fn.get("name"):
+                servers.add(_tool_name_to_server(str(fn["name"])))
+    return sorted(servers)
+
+
+# ---------------------------------------------------------------------------
+# Scoring utilities (ported from mcp-atlas score_claims.py)
+# ---------------------------------------------------------------------------
+
+
+def compute_coverage_score(
+    claim_results: List[Dict[str, Any]]
+) -> Tuple[float, int, int, int]:
+    """Compute coverage score from a list of per-claim results.
+
+    Ported from mcp-atlas score_claims.py ``CoverageEvaluator.evaluate``.
+
+    Args:
+        claim_results: List of dicts with ``coverage_outcome`` key.
+
+    Returns:
+        (coverage_score, fully_covered, partially_covered, not_covered)
+    """
+    if not claim_results:
+        return 0.0, 0, 0, 0
+
+    score_map = {
+        "fulfilled": 1.0,
+        "partially_fulfilled": 0.5,
+        "not_fulfilled": 0.0,
+    }
+
+    total_score = 0.0
+    fulfilled = 0
+    partial = 0
+    not_covered = 0
+
+    for cr in claim_results:
+        outcome = cr.get("coverage_outcome", "not_fulfilled")
+        score = score_map.get(outcome, 0.0)
+        total_score += score
+        if score >= 1.0:
+            fulfilled += 1
+        elif score >= 0.5:
+            partial += 1
+        else:
+            not_covered += 1
+
+    coverage = round(total_score / len(claim_results), 4)
+    return coverage, fulfilled, partial, not_covered
+
+
+def compute_coverage_stats(
+    results: List[Dict[str, Any]],
+    pass_threshold: float = 0.75,
+    model_name: str = "",
+    evaluator_model: str = "",
+) -> Dict[str, Any]:
+    """Compute aggregate coverage statistics.
+
+    Ported from mcp-atlas score_claims.py ``_compute_split_stats`` and
+    ``generate_statistics_and_plots``.
+
+    Args:
+        results: List of per-sample result dicts with ``coverage_score``.
+        pass_threshold: Threshold for pass/fail (default 0.75).
+        model_name: Name of the model being evaluated.
+        evaluator_model: Name of the judge model.
+
+    Returns:
+        A statistics dict.
+    """
+    scores = [
+        r.get("coverage_score", 0.0)
+        for r in results
+        if r.get("coverage_score") is not None
+    ]
+    total = len(results)
+    valid = len(scores)
+
+    mean = sum(scores) / valid if valid else 0.0
+    pass_50 = sum(1 for s in scores if s >= 0.50) / valid if valid else 0.0
+    pass_75 = sum(1 for s in scores if s >= 0.75) / valid if valid else 0.0
+
+    return {
+        "model_name": model_name,
+        "evaluator_model": evaluator_model,
+        "total_tasks": total,
+        "valid_responses": valid,
+        "empty_or_error": total - valid,
+        "mean_coverage": round(mean, 4),
+        "pass_rate_0.50": round(pass_50 * 100, 2),
+        "pass_rate_0.75": round(pass_75 * 100, 2),
+        "pass_threshold": pass_threshold,
+    }
 
 
 # ---------------------------------------------------------------------------

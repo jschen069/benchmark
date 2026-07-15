@@ -2,9 +2,20 @@
 
 Loads predictions from the infer step, scores final answers with an
 LLM judge on a per-claim basis, and computes aggregated metrics
-(coverage_score and pass_rate).  Follows evalscope's
-:meth:`MCPAtlasAdapter.llm_match_score` and
-:meth:`MCPAtlasAdapter.aggregate_scores` patterns.
+(coverage_score and pass_rate).
+
+Ported from the upstream mcp-atlas ``score_claims.py``, adapted for
+aisbench conventions.  Key improvements over the initial version:
+
+- **Enhanced judge prompt**: Uses the detailed mcp-atlas prompt with
+  numerical comparison guidelines and scoring criteria.
+- **Structured JSON output**: Supports ``response_format: json_schema``
+  for models that support it.
+- **Improved response parsing**: More robust parsing of judge responses
+  with multiple fallback strategies.
+- **Rich statistics**: Generates ``coverage_stats`` JSON with mean_coverage,
+  pass_rate at 0.50/0.75 thresholds, and evaluator model info.
+- **Response truncation**: Handles oversized responses gracefully.
 
 """
 
@@ -15,6 +26,7 @@ import os.path as osp
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -38,6 +50,10 @@ from ais_bench.benchmark.tasks.mcp_atlas.utils import (
     _extract_claims,
     _field,
     _parse_claim_judge_response,
+    compute_coverage_score,
+    compute_coverage_stats,
+    extract_claims,
+    get_claim_evaluation_schema,
 )
 
 
@@ -52,11 +68,16 @@ class MCPAtlasEvalTask(BaseTask):
     Results are written to ``results/<model_abbr>/<dataset_abbr>.json``
     (summary) and ``results/<model_abbr>/<dataset_abbr>/details.json``
     (per-sample details).
+
+    Ported from mcp-atlas score_claims.py CoverageEvaluator.
     """
 
     name_prefix = "MCPAtlasEval"
     log_subdir = "logs/eval"
     output_subdir = "results"
+
+    # Maximum response length to send to judge (from mcp-atlas)
+    MAX_RESPONSE_CHARS = 500_000
 
     # -- init --------------------------------------------------------------
 
@@ -66,6 +87,11 @@ class MCPAtlasEvalTask(BaseTask):
         args = dataset_cfg.get("args", {}) or {}
 
         self.pass_threshold = float(args.get("pass_threshold", 0.75))
+
+        # Whether to use structured JSON output (json_schema response_format)
+        self.use_structured_output = bool(
+            args.get("use_structured_output", False)
+        )
 
         # LLM judge configuration (all fields from config, with fallback to main model)
         judge_cfg: Dict[str, Any] = self.model_cfg.get("judge_model") or {}
@@ -78,9 +104,11 @@ class MCPAtlasEvalTask(BaseTask):
 
         self.logger.info(
             "MCPAtlasEvalTask initialized: pass_threshold=%.2f, "
+            "use_structured_output=%s, "
             "judge_model=%s, judge_api_url=%s, judge_temperature=%.2f, "
             "judge_max_tokens=%d, judge_timeout=%d",
             self.pass_threshold,
+            self.use_structured_output,
             self._judge_model or "(main model fallback)",
             self._judge_api_url or "(main model fallback)",
             self._judge_temperature,
@@ -230,7 +258,7 @@ class MCPAtlasEvalTask(BaseTask):
     ) -> Dict[str, Any]:
         """Score a single prediction with the LLM judge.
 
-        Follows evalscope's :meth:`MCPAtlasAdapter.llm_match_score`:
+        Ported from mcp-atlas score_claims.py ``CoverageEvaluator.evaluate``:
         extract claims from ground truth, judge each claim against the
         prediction's final answer, compute coverage_score and pass/fail.
         """
@@ -251,7 +279,7 @@ class MCPAtlasEvalTask(BaseTask):
         claims = list(pred.get("gtfa_claims") or [])
         if not claims and task_id in sample_map:
             sample = sample_map[task_id]
-            claims = _extract_claims(
+            claims = extract_claims(
                 _field(sample, "GTFA_CLAIMS", "gtfa_claims", "rubrics") or "[]"
             )
             self.logger.info(
@@ -271,8 +299,58 @@ class MCPAtlasEvalTask(BaseTask):
                 task_id,
             )
 
-        # Judge each claim (matching evalscope's _judge_claim loop)
+        # Skip LLM judge for empty/error responses (ported from mcp-atlas)
+        if not final_answer or not final_answer.strip() or final_answer.startswith("ERROR:"):
+            self.logger.info(
+                "[Eval:%s] Skipping judge — empty or error response",
+                task_id,
+            )
+            claim_results = [
+                {
+                    "claim": c,
+                    "coverage_outcome": "not_fulfilled",
+                    "score": 0.0,
+                    "justification": "Empty or error response",
+                    "confidence": 1.0,
+                }
+                for c in claims
+            ]
+            coverage, fulfilled, partial, not_covered = compute_coverage_score(
+                claim_results
+            )
+            return {
+                "task_id": task_id,
+                "prompt": prompt,
+                "final_answer": final_answer,
+                "tool_calls": pred.get("tool_calls", 0),
+                "claims": claim_results,
+                "total_claims": len(claim_results),
+                "fully_covered_claims": fulfilled,
+                "partially_covered_claims": partial,
+                "not_covered_claims": not_covered,
+                "coverage_score": coverage,
+                "pass": coverage >= self.pass_threshold,
+                "pass_threshold": self.pass_threshold,
+                "evaluation_confidence": 1.0,
+            }
+
+        # Truncate oversized responses (ported from mcp-atlas)
+        if len(final_answer) > self.MAX_RESPONSE_CHARS:
+            self.logger.warning(
+                "[Eval:%s] Response truncated from %d to %d chars",
+                task_id,
+                len(final_answer),
+                self.MAX_RESPONSE_CHARS,
+            )
+            final_answer = (
+                final_answer[:self.MAX_RESPONSE_CHARS]
+                + "\n\n[TRUNCATED — original response was too long]"
+            )
+
+        # Judge each claim (matching mcp-atlas per-claim evaluation)
         claim_results: List[Dict[str, Any]] = []
+        total_confidence = 0.0
+
         for i, claim in enumerate(claims):
             self.logger.info(
                 "[Eval:%s] Judging claim %d/%d: '%s...'",
@@ -283,6 +361,7 @@ class MCPAtlasEvalTask(BaseTask):
             )
             cr = self._judge_claim(claim, final_answer)
             claim_results.append(cr)
+            total_confidence += cr["confidence"]
             self.logger.info(
                 "[Eval:%s] Claim %d result: outcome=%s score=%.1f "
                 "confidence=%.2f",
@@ -293,25 +372,25 @@ class MCPAtlasEvalTask(BaseTask):
                 cr["confidence"],
             )
 
-        total_claims = len(claim_results)
-        coverage_score = (
-            sum(cr["score"] for cr in claim_results) / total_claims
-            if total_claims else 0.0
+        # Compute aggregated scores (ported from mcp-atlas)
+        coverage, fulfilled, partial, not_covered = compute_coverage_score(
+            claim_results
         )
-        passed = coverage_score >= self.pass_threshold
+        avg_confidence = total_confidence / len(claim_results) if claim_results else 0.5
+        passed = coverage >= self.pass_threshold
 
         self.logger.info(
             "[Eval:%s] Scoring done: coverage_score=%.3f (threshold=%.2f), "
             "pass=%s, claims_total=%d, claims_fulfilled=%d, "
             "claims_partial=%d, claims_not_fulfilled=%d",
             task_id,
-            coverage_score,
+            coverage,
             self.pass_threshold,
             passed,
-            total_claims,
-            sum(1 for cr in claim_results if cr["score"] == 1.0),
-            sum(1 for cr in claim_results if cr["score"] == 0.5),
-            sum(1 for cr in claim_results if cr["score"] == 0.0),
+            len(claim_results),
+            fulfilled,
+            partial,
+            not_covered,
         )
 
         return {
@@ -320,10 +399,14 @@ class MCPAtlasEvalTask(BaseTask):
             "final_answer": final_answer,
             "tool_calls": pred.get("tool_calls", 0),
             "claims": claim_results,
-            "total_claims": total_claims,
-            "coverage_score": coverage_score,
+            "total_claims": len(claim_results),
+            "fully_covered_claims": fulfilled,
+            "partially_covered_claims": partial,
+            "not_covered_claims": not_covered,
+            "coverage_score": coverage,
             "pass": passed,
             "pass_threshold": self.pass_threshold,
+            "evaluation_confidence": round(avg_confidence, 4),
         }
 
     # -- LLM judge ---------------------------------------------------------
@@ -331,7 +414,7 @@ class MCPAtlasEvalTask(BaseTask):
     def _judge_claim(self, claim: str, response: str) -> Dict[str, Any]:
         """Score a single claim with the LLM judge.
 
-        Follows evalscope's :meth:`MCPAtlasAdapter._judge_claim`:
+        Ported from mcp-atlas score_claims.py ``evaluate_single_claim``:
         construct judge prompt → call LLM judge → parse response →
         map outcome to numeric score.
         """
@@ -347,7 +430,7 @@ class MCPAtlasEvalTask(BaseTask):
         outcome, justification, confidence = _parse_claim_judge_response(
             judge_response
         )
-        # Match evalscope's score mapping
+        # Match mcp-atlas's score mapping
         score_map = {
             "fulfilled": 1.0,
             "partially_fulfilled": 0.5,
@@ -376,9 +459,8 @@ class MCPAtlasEvalTask(BaseTask):
     def _call_judge(self, prompt: str) -> str:
         """Call the judge model via OpenAI-compatible API.
 
-        Follows evalscope's :class:`LLMJudge.judge` pattern.
-        All parameters come from the judge_model config dict,
-        falling back to the main model config.
+        Ported from mcp-atlas score_claims.py ``AsyncLiteLLMClient``.
+        Supports optional structured JSON output via ``response_format``.
         """
         url = self._judge_api_url or self.model_cfg.get(
             "api_url", self.model_cfg.get("url", ""),
@@ -386,20 +468,43 @@ class MCPAtlasEvalTask(BaseTask):
         api_key = self._judge_api_key or self.model_cfg.get(
             "api_key", self.model_cfg.get("key", ""),
         )
-        model = self._judge_model or self.model_cfg.get(
-            "model", self.model_cfg.get("abbr", ""),
+        model = (
+            self._judge_model
+            or self.model_cfg.get("model")
+            or os.getenv("AIS_BENCH_MODEL")
+            or os.getenv("MODEL_NAME")
+            or ""
         )
+        if not str(model).strip():
+            raise ValueError(
+                "MCP-Atlas judge model name is empty. Set judge_model.model "
+                "or model in the config, or export AIS_BENCH_MODEL."
+            )
 
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
-        payload = {
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self._judge_temperature,
             "max_tokens": self._judge_max_tokens,
         }
+
+        # Use structured JSON output if enabled (ported from mcp-atlas)
+        if self.use_structured_output:
+            schema = get_claim_evaluation_schema()
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "claim_evaluation",
+                    "schema": schema,
+                },
+            }
+            self.logger.info(
+                "[Judge] Using structured output (json_schema)"
+            )
 
         self.logger.info(
             "[Judge] Calling judge API: url=%s, model=%s, prompt_len=%d, "
@@ -414,7 +519,15 @@ class MCPAtlasEvalTask(BaseTask):
             json=payload,
             timeout=self._judge_timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            self.logger.error(
+                "[Judge] API request failed: status=%s, body=%s",
+                resp.status_code,
+                resp.text[:4000],
+            )
+            raise exc
         data = resp.json()
         choice = (data.get("choices") or [{}])[0]
         result = str(choice.get("message", {}).get("content", "") or "")
@@ -435,12 +548,15 @@ class MCPAtlasEvalTask(BaseTask):
     # -- results -----------------------------------------------------------
 
     def _dump_results(self, results: List[Dict[str, Any]]) -> None:
-        """Aggregate scores and write results (following evalscope's
-        :meth:`MCPAtlasAdapter.aggregate_scores` pattern).
+        """Aggregate scores and write results.
 
-        Writes two files:
+        Ported from mcp-atlas score_claims.py ``generate_statistics_and_plots``.
+
+        Writes:
         - ``results/<model>/<dataset>.json`` — summary with aggregate scores
         - ``results/<model>/<dataset>/details.json`` — per-sample details
+        - ``results/<model>/<dataset>/coverage_stats_<model>.json`` — coverage
+          statistics (mean, pass rates at 0.50/0.75)
         """
         dataset_cfg = self.dataset_cfgs[0]
         dataset_abbr = dataset_abbr_from_cfg(dataset_cfg)
@@ -451,52 +567,51 @@ class MCPAtlasEvalTask(BaseTask):
         out_detail_dir = osp.join(out_dir, dataset_abbr)
         mkdir_or_exist(out_detail_dir)
 
-        # Aggregate scores (matching evalscope's aggregate_scores)
+        # Compute coverage statistics (ported from mcp-atlas)
+        model_name = self._judge_model or model_abbr
+        stats = compute_coverage_stats(
+            results,
+            pass_threshold=self.pass_threshold,
+            model_name=model_name,
+            evaluator_model=self._judge_model or "(main model)",
+        )
+
+        # Aggregate claims (matching mcp-atlas)
         n_samples = len(results)
-        if n_samples > 0:
-            avg_coverage = sum(
-                r["coverage_score"] for r in results
-            ) / n_samples
-            pass_rate = sum(1 for r in results if r["pass"]) / n_samples
-            fully_covered = sum(
-                1 for r in results
-                for cr in (r.get("claims") or [])
-                if cr.get("score") == 1.0
-            )
-            partially_covered = sum(
-                1 for r in results
-                for cr in (r.get("claims") or [])
-                if cr.get("score") == 0.5
-            )
-            not_covered = sum(
-                1 for r in results
-                for cr in (r.get("claims") or [])
-                if cr.get("score") == 0.0
-            )
-        else:
-            avg_coverage = 0.0
-            pass_rate = 0.0
-            fully_covered = 0
-            partially_covered = 0
-            not_covered = 0
+        fully_covered = sum(
+            r.get("fully_covered_claims", 0) for r in results
+        )
+        partially_covered = sum(
+            r.get("partially_covered_claims", 0) for r in results
+        )
+        not_covered = sum(
+            r.get("not_covered_claims", 0) for r in results
+        )
 
         summary = {
             "total_count": n_samples,
-            "coverage_score": round(avg_coverage, 4),
-            "pass_rate": round(pass_rate, 4),
+            "coverage_score": stats["mean_coverage"],
+            "pass_rate": round(
+                stats["pass_rate_0.75"] / 100, 4
+            ) if stats["pass_rate_0.75"] is not None else 0.0,
+            "pass_rate_0.50": stats["pass_rate_0.50"],
+            "pass_rate_0.75": stats["pass_rate_0.75"],
             "pass_threshold": self.pass_threshold,
             "fully_covered_claims": fully_covered,
             "partially_covered_claims": partially_covered,
             "not_covered_claims": not_covered,
+            "evaluator_model": stats["evaluator_model"],
         }
 
         self.logger.info(
             "Evaluation summary: samples=%d, avg_coverage=%.4f, "
-            "pass_rate=%.4f (threshold=%.2f), claims: %d fulfilled, "
+            "pass_rate_0.75=%.2f%%, pass_rate_0.50=%.2f%%, "
+            "threshold=%.2f, claims: %d fulfilled, "
             "%d partial, %d not_fulfilled",
             n_samples,
-            avg_coverage,
-            pass_rate,
+            stats["mean_coverage"],
+            stats["pass_rate_0.75"],
+            stats["pass_rate_0.50"],
             self.pass_threshold,
             fully_covered,
             partially_covered,
@@ -522,6 +637,17 @@ class MCPAtlasEvalTask(BaseTask):
             detail_path,
             len(results),
             osp.getsize(detail_path),
+        )
+
+        # Write coverage stats JSON (ported from mcp-atlas)
+        stats_path = osp.join(
+            out_detail_dir,
+            f"coverage_stats_{model_abbr}_all.json",
+        )
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+        self.logger.info(
+            "Coverage stats saved to %s", stats_path,
         )
 
 

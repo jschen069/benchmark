@@ -5,6 +5,21 @@ calls live MCP tools via subprocess isolation, and saves final answers
 as predictions.  The predictions are later scored by
 :class:`MCPAtlasEvalTask`.
 
+Ported from the upstream mcp-atlas agent-harness (TypeScript) and
+``run_eval.py``, adapted for aisbench conventions.  Key improvements
+over the initial version:
+
+- **Robust tool-call detection**: Uses ``detect_tool_calls`` with structure
+  validation (matching the Zod schema in mcp-atlas agent-eval.ts).
+- **LLM retry logic**: Transient errors (503, 429, timeout) are retried
+  with exponential backoff (matching litellm-strategy.ts).
+- **Error recovery**: Tool-call failures are fed back to the model as
+  tool results instead of being silently dropped.
+- **Context window management**: Optional ``compact`` mode truncates old
+  tool results, and ``tool_output_cap`` limits individual tool responses.
+- **Full trajectory recording**: The complete message history is saved
+  for diagnostics and evaluation.
+
 """
 
 import argparse
@@ -36,6 +51,7 @@ from ais_bench.benchmark.tasks.mcp_atlas.utils import (
     DEFAULT_SYSTEM_PROMPT,
     MCPAtlasClient,
     MCPAtlasServerUnavailable,
+    MAX_LLM_RETRIES,
     _call_tool_subprocess,
     _extract_claims,
     _extract_required_servers,
@@ -44,7 +60,14 @@ from ais_bench.benchmark.tasks.mcp_atlas.utils import (
     _parse_enabled_tools,
     _server_unavailable_message,
     _tool_name_to_server,
+    build_messages,
+    cap_tool_content,
+    compact_messages,
+    detect_tool_calls,
+    get_retry_delay,
+    is_retryable_error,
     mcp_tool_to_tool_info,
+    pruned_tool_call,
 )
 
 
@@ -84,11 +107,21 @@ class MCPAtlasInferTask(BaseTask):
         self.list_tools_timeout = float(args.get("list_tools_timeout", 180.0))
         self.use_system_prompt = bool(args.get("use_system_prompt", False))
 
+        # Context window management (ported from mcp-atlas)
+        self.context_window_management = str(
+            args.get("context_window_management", "")
+        )
+        self.tool_output_cap = args.get("tool_output_cap")  # None = uncapped
+
         # Model inference config
         infer_cfg: Dict[str, Any] = self.model_cfg.get("infer_cfg") or {}
         self._model_temperature = float(infer_cfg.get("temperature", 0.0))
         self._model_max_tokens = int(infer_cfg.get("max_tokens", 2048))
         self._model_timeout = int(infer_cfg.get("timeout", 120))
+        self._tool_choice = str(
+            infer_cfg.get("tool_choice")
+            or self.model_cfg.get("tool_choice", "auto")
+        )
 
         # Internal state
         self._client: Optional[MCPAtlasClient] = None
@@ -100,6 +133,7 @@ class MCPAtlasInferTask(BaseTask):
             "MCPAtlasInferTask initialized: mcp_server_url=%s, "
             "filter_enabled_servers=%s, max_steps=%d, max_tool_calls=%d, "
             "request_timeout=%.1f, use_system_prompt=%s, "
+            "context_window_management=%s, tool_output_cap=%s, "
             "model_temperature=%.2f, model_max_tokens=%d, model_timeout=%d",
             self.mcp_server_url,
             self.filter_enabled_servers,
@@ -107,6 +141,8 @@ class MCPAtlasInferTask(BaseTask):
             self.max_tool_calls,
             self.request_timeout,
             self.use_system_prompt,
+            self.context_window_management or "(off)",
+            str(self.tool_output_cap),
             self._model_temperature,
             self._model_max_tokens,
             self._model_timeout,
@@ -286,8 +322,8 @@ class MCPAtlasInferTask(BaseTask):
     def _run_sample(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         """Run the agent loop on a single sample.
 
-        Follows evalscope's record_to_sample flow: extract fields,
-        construct prompt, build tool payload, run agent loop.
+        Follows mcp-atlas's record_to_sample flow: extract fields,
+        construct messages, build tool payload, run agent loop.
         """
         task_id = str(_field(sample, "TASK", "task", "task_id") or "")
         prompt = str(_field(sample, "PROMPT", "prompt") or "")
@@ -310,20 +346,22 @@ class MCPAtlasInferTask(BaseTask):
             len(_maybe_parse_json(trajectory, default=[])) if isinstance(trajectory, str) else 0,
         )
 
-        # Construct prompt following evalscope's pattern
-        input_text = prompt
+        # Construct messages using build_messages (ported from mcp-atlas)
+        system_prompt = DEFAULT_SYSTEM_PROMPT if self.use_system_prompt else None
+        messages = build_messages(prompt, system_prompt)
+
         if self.use_system_prompt:
-            input_text = f"{DEFAULT_SYSTEM_PROMPT}\n\n{prompt}"
             self.logger.info(
-                "[%s] System prompt prepended (total prompt_len=%d)",
+                "[%s] System prompt prepended (total messages=%d, prompt_len=%d)",
                 task_id,
-                len(input_text),
+                len(messages),
+                len(messages[0]["content"]) if messages else 0,
             )
         else:
             self.logger.info(
                 "[%s] System prompt disabled, using raw prompt (len=%d)",
                 task_id,
-                len(input_text),
+                len(prompt),
             )
 
         # Build tools payload for the model
@@ -335,17 +373,19 @@ class MCPAtlasInferTask(BaseTask):
         )
 
         # Run agent loop
-        final_answer, tool_call_count, server_failures = self._agent_loop(
-            input_text, tools_payload, enabled_tools, task_id,
+        (final_answer, tool_call_count, server_failures,
+         full_trajectory) = self._agent_loop(
+            messages, tools_payload, enabled_tools, task_id,
         )
 
         self.logger.info(
             "[%s] Agent loop finished: final_answer_len=%d, "
-            "tool_call_count=%d, server_failures=%s",
+            "tool_call_count=%d, server_failures=%s, trajectory_msgs=%d",
             task_id,
             len(final_answer),
             tool_call_count,
             list(server_failures.keys()) if server_failures else "none",
+            len(full_trajectory),
         )
 
         return {
@@ -359,6 +399,8 @@ class MCPAtlasInferTask(BaseTask):
             "gtfa_claims": claims,
             "trajectory": trajectory,
             "enabled_tools": enabled_tools,
+            # Full trajectory (complete message history) for diagnostics
+            "raw_conversation_history": full_trajectory,
         }
 
     # -- tools --------------------------------------------------------------
@@ -385,74 +427,115 @@ class MCPAtlasInferTask(BaseTask):
 
     def _agent_loop(
         self,
-        user_prompt: str,
+        messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         enabled_tools: List[str],
         task_id: str = "",
-    ) -> Tuple[str, int, Dict[str, str]]:
+    ) -> Tuple[str, int, Dict[str, str], List[Dict[str, Any]]]:
         """Run the agent conversation loop with the MCP-Atlas service.
+
+        Ported from mcp-atlas agent-eval.ts ``runMcpAgent``.  Key features:
+
+        - **Tool call detection**: Uses ``detect_tool_calls`` for robust
+          structure validation (matching the Zod schema in mcp-atlas).
+        - **LLM retry**: Transient errors (503, 429, timeout) are retried
+          up to ``MAX_LLM_RETRIES`` times with exponential backoff.
+        - **Error recovery**: Tool-call failures are fed back to the model
+          as tool results so the model can recover.
+        - **Context compaction**: Optional ``compact`` mode truncates old
+          tool results when context grows large.
+        - **Tool output cap**: Optional per-result character limit.
 
         Each MCP tool call is executed in a child process via
         :func:`_call_tool_subprocess` for process isolation.
 
         Returns:
-            (final_answer, tool_call_count, server_failures)
+            (final_answer, tool_call_count, server_failures, trajectory)
         """
-        messages: List[Dict[str, Any]] = [
-            {"role": "user", "content": user_prompt}
-        ]
+        all_messages: List[Dict[str, Any]] = list(messages)
 
         tool_call_count = 0
         server_failures: Dict[str, str] = {}
         final_answer = ""
+        reached_max_turns = True
 
         self.logger.info(
             "[%s] Agent loop start: max_steps=%d, max_tool_calls=%d, "
-            "tools_available=%d",
+            "tools_available=%d, messages=%d",
             task_id,
             self.max_steps,
             self.max_tool_calls,
             len(tools),
+            len(all_messages),
         )
 
         for step in range(self.max_steps):
+            # Check tool call limit before next LLM call
+            if self.max_tool_calls and tool_call_count >= self.max_tool_calls:
+                reached_max_turns = False
+                self.logger.warning(
+                    "[%s] Step %d: tool call limit reached (%d) before LLM call",
+                    task_id, step + 1, self.max_tool_calls,
+                )
+                break
+
+            # Apply context compaction if enabled
+            messages_to_send = all_messages
+            if self.context_window_management == "compact":
+                messages_to_send = compact_messages(all_messages, step + 1)
+                if messages_to_send is not all_messages:
+                    orig_chars = sum(len(json.dumps(m)) for m in all_messages)
+                    compact_chars = sum(len(json.dumps(m)) for m in messages_to_send)
+                    saved = orig_chars - compact_chars
+                    if saved > 0:
+                        self.logger.info(
+                            "[%s] Compact: %d → %d chars (saved %d, %.1f%%)",
+                            task_id, orig_chars, compact_chars, saved,
+                            saved / orig_chars * 100,
+                        )
+
             self.logger.info(
                 "[%s] Step %d: calling model (messages=%d, tools=%d)...",
                 task_id,
                 step + 1,
-                len(messages),
-                len(tools) if step == 0 else 0,  # tools only sent on step 0
+                len(messages_to_send),
+                len(tools) if step == 0 else 0,
             )
-            response = self._call_model(messages, tools if step == 0 else [])
+
+            # Call LLM with retry logic (ported from mcp-atlas)
+            response = self._call_model_with_retry(
+                messages_to_send, tools if step == 0 else [], task_id, step,
+            )
 
             choice = (response.get("choices") or [{}])[0]
             message = choice.get("message", {})
             finish_reason = choice.get("finish_reason", "unknown")
 
-            # Model wants to call a tool
-            if message.get("tool_calls"):
+            # Robust tool call detection (ported from mcp-atlas)
+            tool_calls = detect_tool_calls(message)
+
+            if tool_calls:
                 tool_names_in_msg = [
-                    tc.get("function", {}).get("name", "?")
-                    for tc in message["tool_calls"]
+                    tc["function"]["name"] for tc in tool_calls
                 ]
                 self.logger.info(
                     "[%s] Step %d: model requested %d tool call(s): %s "
                     "(finish_reason=%s)",
                     task_id,
                     step + 1,
-                    len(message["tool_calls"]),
+                    len(tool_calls),
                     tool_names_in_msg,
                     finish_reason,
                 )
-                messages.append(message)
+                all_messages.append(message)
 
-                for tc in message["tool_calls"]:
-                    if tool_call_count >= self.max_tool_calls:
+                for tc in tool_calls:
+                    # Check tool call limit before executing
+                    if self.max_tool_calls and tool_call_count >= self.max_tool_calls:
+                        reached_max_turns = False
                         self.logger.warning(
                             "[%s] Step %d: tool call limit reached (%d)",
-                            task_id,
-                            step + 1,
-                            self.max_tool_calls,
+                            task_id, step + 1, self.max_tool_calls,
                         )
                         break
 
@@ -464,6 +547,9 @@ class MCPAtlasInferTask(BaseTask):
                     if not isinstance(tool_args, dict):
                         tool_args = {}
 
+                    # Apply tool-specific pruning (ported from mcp-atlas)
+                    tool_args = pruned_tool_call(tool_name, tool_args)
+
                     self.logger.info(
                         "[%s] Step %d: executing tool '%s' args=%s",
                         task_id,
@@ -472,7 +558,7 @@ class MCPAtlasInferTask(BaseTask):
                         json.dumps(tool_args, ensure_ascii=False),
                     )
 
-                    # Short-circuit failed servers (matching evalscope)
+                    # Short-circuit failed servers (matching mcp-atlas)
                     server = _tool_name_to_server(tool_name)
                     if server in server_failures:
                         result = _server_unavailable_message(
@@ -481,11 +567,9 @@ class MCPAtlasInferTask(BaseTask):
                         self.logger.info(
                             "[%s] Step %d: server '%s' already failed, "
                             "short-circuiting tool '%s'",
-                            task_id,
-                            step + 1,
-                            server,
-                            tool_name,
+                            task_id, step + 1, server, tool_name,
                         )
+                        tool_call_count += 1
                     else:
                         try:
                             # Execute tool call via subprocess for isolation
@@ -496,41 +580,47 @@ class MCPAtlasInferTask(BaseTask):
                                 timeout=self.request_timeout,
                             )
                             tool_call_count += 1
+
+                            # Apply tool output cap if configured
+                            if self.tool_output_cap is not None:
+                                result = cap_tool_content(
+                                    result, self.tool_output_cap
+                                )
+
                             self.logger.info(
                                 "[%s] Step %d: tool '%s' succeeded "
                                 "(total_calls=%d, result_len=%d)",
-                                task_id,
-                                step + 1,
-                                tool_name,
-                                tool_call_count,
-                                len(result),
+                                task_id, step + 1,
+                                tool_name, tool_call_count, len(result),
                             )
                         except MCPAtlasServerUnavailable as exc:
+                            # Error recovery: feed error back to model
+                            # (ported from mcp-atlas agent-eval.ts)
                             server_failures[exc.server_name] = exc.message
-                            result = _server_unavailable_message(
-                                exc.server_name, exc.message
-                            )
+                            error_msg = exc.message.split("\n")[0]
+                            result = f"Error: {error_msg}"
+                            tool_call_count += 1
                             self.logger.warning(
                                 "[%s] Step %d: server '%s' unavailable "
-                                "for tool '%s': %s",
-                                task_id,
-                                step + 1,
-                                exc.server_name,
-                                tool_name,
-                                exc.message[:200],
+                                "for tool '%s': %s — feeding error back to model",
+                                task_id, step + 1,
+                                exc.server_name, tool_name, error_msg[:200],
                             )
 
-                    messages.append({
+                    # Build tool result message (OpenAI format)
+                    tool_result_msg: Dict[str, Any] = {
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
                         "content": result,
-                    })
+                    }
+                    all_messages.append(tool_result_msg)
 
-                if tool_call_count >= self.max_tool_calls:
+                if self.max_tool_calls and tool_call_count >= self.max_tool_calls:
                     final_answer = (
                         "MCP-Atlas tool call limit exceeded "
                         f"({self.max_tool_calls})."
                     )
+                    reached_max_turns = False
                     self.logger.warning(
                         "[%s] Tool call limit reached, stopping agent loop.",
                         task_id,
@@ -538,25 +628,22 @@ class MCPAtlasInferTask(BaseTask):
                     break
                 continue
 
-            # Model returned a final text answer
+            # Model returned a final text answer — natural completion
+            reached_max_turns = False
             final_answer = str(
                 message.get("content", "") or response.get("content", "")
             )
             self.logger.info(
                 "[%s] Step %d: model returned final answer "
                 "(finish_reason=%s, answer_len=%d)",
-                task_id,
-                step + 1,
-                finish_reason,
-                len(final_answer),
+                task_id, step + 1, finish_reason, len(final_answer),
             )
             break
         else:
             final_answer = final_answer or "Agent loop exceeded max steps."
             self.logger.warning(
                 "[%s] Agent loop exceeded max_steps=%d, stopping.",
-                task_id,
-                self.max_steps,
+                task_id, self.max_steps,
             )
 
         self.logger.info(
@@ -568,7 +655,45 @@ class MCPAtlasInferTask(BaseTask):
             len(server_failures),
             len(final_answer),
         )
-        return final_answer, tool_call_count, server_failures
+        return final_answer, tool_call_count, server_failures, all_messages
+
+    # -- model call with retry (ported from mcp-atlas litellm-strategy.ts) --
+
+    def _call_model_with_retry(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        task_id: str,
+        step: int,
+    ) -> Dict[str, Any]:
+        """Call the LLM API with retry logic for transient errors.
+
+        Ported from mcp-atlas litellm-strategy.ts retry logic:
+        - Retries on 500, 502, 503, 429, and timeouts
+        - Exponential backoff for 429, fixed delays for others
+        - Up to MAX_LLM_RETRIES attempts
+        """
+        last_error: Optional[Exception] = None
+
+        for attempt in range(MAX_LLM_RETRIES):
+            try:
+                return self._call_model(messages, tools)
+            except Exception as exc:
+                last_error = exc
+                if is_retryable_error(exc) and attempt < MAX_LLM_RETRIES - 1:
+                    delay = get_retry_delay(exc, attempt)
+                    self.logger.warning(
+                        "[%s] Step %d: LLM call failed (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        task_id, step + 1, attempt + 1, MAX_LLM_RETRIES,
+                        delay, str(exc)[:200],
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+
+        # Should not reach here, but just in case
+        raise last_error  # type: ignore
 
     # -- model call --------------------------------------------------------
 
@@ -578,9 +703,32 @@ class MCPAtlasInferTask(BaseTask):
         tools: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Call the LLM API (OpenAI-compatible chat completions)."""
-        url = self.model_cfg.get("api_url", self.model_cfg.get("url", ""))
-        api_key = self.model_cfg.get("api_key", self.model_cfg.get("key", ""))
-        model = self.model_cfg.get("model", self.model_cfg.get("abbr", ""))
+        url = (
+            self.model_cfg.get("api_url")
+            or self.model_cfg.get("url")
+            or os.getenv("AIS_BENCH_API_URL", "")
+        )
+        api_key = (
+            self.model_cfg.get("api_key")
+            or self.model_cfg.get("key")
+            or os.getenv("AIS_BENCH_API_KEY", "")
+        )
+        model = (
+            self.model_cfg.get("model")
+            or os.getenv("AIS_BENCH_MODEL")
+            or os.getenv("MODEL_NAME")
+            or ""
+        )
+        if not str(model).strip():
+            raise ValueError(
+                "MCP-Atlas model name is empty. Set model in "
+                "ais_bench/configs/mcp_atlas_examples/mcp_atlas.py or export "
+                "AIS_BENCH_MODEL to the model name served by the OpenAI-compatible endpoint."
+            )
+        if not str(url).strip():
+            raise ValueError(
+                "MCP-Atlas API URL is empty. Set url/api_url in the config or export AIS_BENCH_API_URL."
+            )
 
         headers = {
             "Content-Type": "application/json",
@@ -594,6 +742,7 @@ class MCPAtlasInferTask(BaseTask):
         }
         if tools:
             payload["tools"] = tools
+            payload["tool_choice"] = self._tool_choice
 
         self.logger.info(
             "Calling model: url=%s, model=%s, messages=%d, tools=%d, "
@@ -608,7 +757,23 @@ class MCPAtlasInferTask(BaseTask):
             json=payload,
             timeout=self._model_timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            hint = ""
+            if tools and resp.status_code == 400:
+                hint = (
+                    " If this is a vLLM endpoint, restart it with OpenAI tool "
+                    "calling enabled, for example: --enable-auto-tool-choice "
+                    "--tool-call-parser <parser-compatible-with-your-model>."
+                )
+            self.logger.error(
+                "Model API request failed: status=%s, body=%s%s",
+                resp.status_code,
+                resp.text[:4000],
+                hint,
+            )
+            raise exc
         response_json = resp.json()
 
         usage = response_json.get("usage", {})
