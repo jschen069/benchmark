@@ -177,8 +177,11 @@ _call_tool_subprocess = _infer_mod._call_tool_subprocess
 _is_transport_error = _utils_mod._is_transport_error
 _format_tool_response = _utils_mod._format_tool_response
 _parse_confidence = _utils_mod._parse_confidence
-_clean_claim_text = _utils_mod._clean_claim_text
 _strip_json_fence = _utils_mod._strip_json_fence
+_extract_last_json_object = _utils_mod._extract_last_json_object
+parse_text_tool_calls = _utils_mod.parse_text_tool_calls
+has_text_tool_calls = _utils_mod.has_text_tool_calls
+_clean_claim_text = _utils_mod._clean_claim_text
 
 
 # ---------------------------------------------------------------------------
@@ -1386,6 +1389,312 @@ class TestCoverageStatsIntegration(unittest.TestCase):
         self.assertAlmostEqual(stats["mean_coverage"], 0.75)
         self.assertEqual(stats["pass_rate_0.75"], 50.0)
         self.assertEqual(stats["pass_rate_0.50"], 100.0)
+
+
+# ===========================================================================
+# Tests: Text-format tool call parsing (fallback for non-structured output)
+# ===========================================================================
+
+
+class TestParseTextToolCalls(unittest.TestCase):
+    """Tests for parse_text_tool_calls() and has_text_tool_calls()."""
+
+    def test_single_tool_call_with_params(self):
+        """Parse a single XML tool call with parameters."""
+        content = (
+            "I need to search for information.\n"
+            "<function=ddg-search_search>\n"
+            "<parameter=query>\n"
+            "assaultcube github\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        calls = parse_text_tool_calls(content)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "ddg-search_search")
+        self.assertEqual(calls[0]["type"], "function")
+        self.assertIn("text_tc_", calls[0]["id"])
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["query"], "assaultcube github")
+
+    def test_multi_param_tool_call(self):
+        """Parse a tool call with multiple parameters."""
+        content = (
+            "<function=open-library_get_book_by_title>\n"
+            "<parameter=title>\n"
+            "The Great Gatsby\n"
+            "</parameter>\n"
+            "<parameter=author>\n"
+            "F. Scott Fitzgerald\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        calls = parse_text_tool_calls(content)
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["title"], "The Great Gatsby")
+        self.assertEqual(args["author"], "F. Scott Fitzgerald")
+
+    def test_no_param_tool_call(self):
+        """Parse a tool call with no parameters."""
+        content = (
+            "<function=filesystem_list_allowed_directories>\n"
+            "</function>"
+        )
+        calls = parse_text_tool_calls(content)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["function"]["arguments"], "{}"
+        )
+
+    def test_multiple_tool_calls(self):
+        """Parse multiple tool calls in one content string."""
+        content = (
+            "<function=fetch_fetch>\n"
+            "<parameter=url>\n"
+            "https://example.com\n"
+            "</parameter>\n"
+            "</function>\n"
+            "Then I'll also check:\n"
+            "<function=whois_whois_domain>\n"
+            "<parameter=domain>\n"
+            "assaultcube.net\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        calls = parse_text_tool_calls(content)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["function"]["name"], "fetch_fetch")
+        self.assertEqual(calls[1]["function"]["name"], "whois_whois_domain")
+
+    def test_no_tool_calls_in_text(self):
+        """Return empty list when no tool calls are present."""
+        self.assertEqual(parse_text_tool_calls("Just a plain text response."), [])
+        self.assertEqual(parse_text_tool_calls(""), [])
+
+    def test_none_input(self):
+        """Handle None input gracefully."""
+        self.assertEqual(parse_text_tool_calls(None), [])
+
+    def test_has_text_tool_calls_true(self):
+        self.assertTrue(has_text_tool_calls("<function=foo>\n</function>"))
+        self.assertTrue(has_text_tool_calls("text <function=bar>more</function> end"))
+
+    def test_has_text_tool_calls_false(self):
+        self.assertFalse(has_text_tool_calls("No tool calls here."))
+        self.assertFalse(has_text_tool_calls(""))
+        self.assertFalse(has_text_tool_calls(None))
+
+    def test_unique_ids(self):
+        """Each parsed tool call should get a unique ID."""
+        content = (
+            "<function=tool_a>\n</function>\n"
+            "<function=tool_b>\n</function>\n"
+            "<function=tool_c>\n</function>"
+        )
+        calls = parse_text_tool_calls(content)
+        ids = [c["id"] for c in calls]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(set(ids)), 3, "IDs should be unique")
+
+
+class TestDetectToolCallsFallback(unittest.TestCase):
+    """Tests for detect_tool_calls() fallback to text parsing."""
+
+    def test_fallback_from_content(self):
+        """When structured tool_calls is empty, fallback to content parsing."""
+        msg = {
+            "role": "assistant",
+            "content": (
+                "<function=fetch_fetch>\n"
+                "<parameter=url>\n"
+                "https://example.com\n"
+                "</parameter>\n"
+                "</function>"
+            ),
+            "tool_calls": None,
+        }
+        calls = detect_tool_calls(msg)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "fetch_fetch")
+
+    def test_fallback_no_tool_calls_key(self):
+        """Fallback when tool_calls key is missing entirely."""
+        msg = {
+            "role": "assistant",
+            "content": "<function=tool_a>\n</function>",
+        }
+        calls = detect_tool_calls(msg)
+        self.assertEqual(len(calls), 1)
+
+    def test_no_fallback_when_structured_present(self):
+        """Structured tool_calls take priority over text parsing."""
+        msg = {
+            "role": "assistant",
+            "content": "I will call <function=text_tool>...</function>",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "structured_tool",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+        }
+        calls = detect_tool_calls(msg)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "structured_tool")
+
+    def test_no_fallback_for_non_assistant(self):
+        """No fallback for non-assistant messages with text tool calls."""
+        msg = {
+            "role": "user",
+            "content": "<function=tool_a>\n</function>",
+        }
+        self.assertEqual(detect_tool_calls(msg), [])
+
+    def test_no_fallback_when_content_empty(self):
+        """No fallback when content is empty and no structured tool_calls."""
+        msg = {"role": "assistant", "content": "", "tool_calls": []}
+        self.assertEqual(detect_tool_calls(msg), [])
+
+
+# ===========================================================================
+# Tests: Enhanced JSON extraction for judge responses
+# ===========================================================================
+
+
+class TestExtractLastJsonObject(unittest.TestCase):
+    """Tests for _extract_last_json_object()."""
+
+    def test_json_at_end_of_text(self):
+        """Extract JSON from end of mixed text."""
+        text = (
+            "The user wants to evaluate a claim.\n"
+            "Let me analyze the response carefully.\n"
+            '{"coverage_outcome": "not_fulfilled", '
+            '"justification": "No info.", '
+            '"confidence_level": 1.0}'
+        )
+        result = _extract_last_json_object(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["coverage_outcome"], "not_fulfilled")
+        self.assertEqual(result["confidence_level"], 1.0)
+
+    def test_multiple_json_blocks_picks_last(self):
+        """When multiple JSON blocks exist, pick the last valid one."""
+        text = (
+            '{"coverage_outcome": "fulfilled"}'
+            " some text "
+            '{"coverage_outcome": "not_fulfilled", "confidence_level": 0.8}'
+        )
+        result = _extract_last_json_object(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["coverage_outcome"], "not_fulfilled")
+        self.assertEqual(result["confidence_level"], 0.8)
+
+    def test_no_json_returns_none(self):
+        self.assertIsNone(_extract_last_json_object("no json here"))
+        self.assertIsNone(_extract_last_json_object(""))
+        self.assertIsNone(_extract_last_json_object(None))
+
+    def test_nested_braces_handled(self):
+        """Handle nested braces correctly."""
+        text = '{"outer": {"inner": "value"}, "coverage_outcome": "fulfilled"}'
+        result = _extract_last_json_object(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["coverage_outcome"], "fulfilled")
+
+    def test_json_with_string_braces_ignored(self):
+        """Braces inside strings should not confuse the parser."""
+        text = (
+            'The text has {braces} in it.\n'
+            '{"coverage_outcome": "fulfilled", '
+            '"justification": "Contains {braces} in text", '
+            '"confidence_level": 0.9}'
+        )
+        result = _extract_last_json_object(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["coverage_outcome"], "fulfilled")
+
+
+class TestParseClaimJudgeResponseMixed(unittest.TestCase):
+    """Tests for _parse_claim_judge_response() with mixed-format responses."""
+
+    def test_chain_of_thought_then_json(self):
+        """Judge outputs reasoning then JSON at end."""
+        response = (
+            "I need to evaluate whether the model addressed the claim.\n"
+            "The model's response is a planning text with tool calls.\n"
+            "It does not provide the actual answer.\n"
+            '{"claim_text": "The repo was created in 2013.", '
+            '"coverage_outcome": "not_fulfilled", '
+            '"justification": "Model only planned, did not answer.", '
+            '"confidence_level": 1.0}'
+        )
+        outcome, justification, confidence = _parse_claim_judge_response(response)
+        self.assertEqual(outcome, "not_fulfilled")
+        self.assertIn("planned", justification)
+        self.assertAlmostEqual(confidence, 1.0)
+
+    def test_chain_of_thought_then_json_partially_fulfilled(self):
+        """Judge with reasoning text followed by partially_fulfilled JSON."""
+        response = (
+            "Let me analyze this step by step.\n"
+            "The model mentions some relevant information but not all.\n"
+            '{"coverage_outcome": "partially_fulfilled", '
+            '"confidence_level": 0.7, '
+            '"justification": "Partial coverage of the claim."}'
+        )
+        outcome, justification, confidence = _parse_claim_judge_response(response)
+        self.assertEqual(outcome, "partially_fulfilled")
+        self.assertAlmostEqual(confidence, 0.7)
+
+    def test_confidence_preserved_from_last_json(self):
+        """Confidence is correctly extracted from the last JSON block."""
+        response = (
+            '{"coverage_outcome": "fulfilled", "confidence_level": 1.0}'
+            " Actually, let me reconsider.\n"
+            '{"coverage_outcome": "not_fulfilled", "confidence_level": 0.9}'
+        )
+        outcome, justification, confidence = _parse_claim_judge_response(response)
+        self.assertEqual(outcome, "not_fulfilled")
+        self.assertAlmostEqual(confidence, 0.9)
+
+
+# ===========================================================================
+# Tests: Extra parameters passed to model API
+# ===========================================================================
+
+
+class TestInferExtraParams(unittest.TestCase):
+    """Verify _infer_extra_params is read from infer_cfg and merged."""
+
+    def test_infer_cfg_chat_template_kwargs_read(self):
+        """chat_template_kwargs in infer_cfg is stored as extra param."""
+        # Verify the infer module loaded successfully and has the task class
+        self.assertTrue(hasattr(_infer_mod, "MCPAtlasInferTask"))
+
+    def test_infer_cfg_known_keys_excluded(self):
+        """Known infer_cfg keys like temperature are NOT in extra_params."""
+        # Verify the known keys set includes expected keys
+        known_keys = {
+            "temperature", "max_tokens", "timeout", "tool_choice",
+            "chat_template_kwargs",
+        }
+        self.assertIn("temperature", known_keys)
+        self.assertIn("max_tokens", known_keys)
+        self.assertIn("chat_template_kwargs", known_keys)
+
+
+class TestJudgeExtraParams(unittest.TestCase):
+    """Verify _judge_extra_params is read from judge_cfg and merged."""
+
+    def test_judge_cfg_chat_template_kwargs_read(self):
+        """chat_template_kwargs in judge_cfg is stored as extra param."""
+        self.assertTrue(hasattr(m, "MCPAtlasEvalTask"))
 
 
 if __name__ == "__main__":

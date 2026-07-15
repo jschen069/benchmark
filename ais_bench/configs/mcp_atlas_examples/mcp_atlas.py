@@ -19,9 +19,18 @@ Pre-requisites
 2. Ensure the service is reachable at ``http://localhost:1984`` (or update
    ``mcp_server_url`` below).
 
-"""
+3. Set the environment variables below or edit the placeholders directly
+   (mmengine config does not support ``os.getenv`` calls)::
 
-import os
+    export AIS_BENCH_API_KEY="sk-..."
+    export AIS_BENCH_API_URL="http://127.0.0.1:8005/v1"
+    export AIS_BENCH_MODEL="your-model-name"
+
+   The task code reads these same env vars at runtime, so they only need
+   to be set in the environment – the placeholder strings below are just
+   fallbacks for the config parser.
+
+"""
 
 from ais_bench.benchmark.datasets import MCPAtlasDataset
 from ais_bench.benchmark.partitioners import NaivePartitioner
@@ -36,26 +45,28 @@ from ais_bench.benchmark.tasks import MCPAtlasInferTask, MCPAtlasEvalTask
 models = [
     dict(
         abbr="mcp_atlas_model",
-        api_key=os.getenv("AIS_BENCH_API_KEY", "EMPTY"),
-        url=os.getenv("AIS_BENCH_API_URL", "http://127.0.0.1:8005/v1"),
-        model=os.getenv("AIS_BENCH_MODEL", os.getenv("MODEL_NAME", "")),
-        # ---- Model inference config (for agent loop API calls) -----------
-        # Matches mcp-atlas defaults: temperature=0, max_tokens=unlimited
+        api_key="",
+        url="http://127.0.0.1:8005/v1",
+        model="qwen3.6",
         infer_cfg=dict(
-            temperature=0.0,
+            temperature=0.7,
             max_tokens=32768,
             timeout=300,
             tool_choice="auto",
+            chat_template_kwargs=dict(
+                enable_thinking=False,
+            ),
         ),
-        # ---- LLM judge config (optional; defaults to main model above) ---
-        # Matches mcp-atlas score_claims.py defaults
         judge_model=dict(
-            model=os.getenv("AIS_BENCH_JUDGE_MODEL", ""),
-            api_key=os.getenv("AIS_BENCH_JUDGE_API_KEY", ""),
-            api_url=os.getenv("AIS_BENCH_JUDGE_API_URL", ""),
+            model="qwen3.6",
+            api_key="",
+            api_url="http://127.0.0.1:8005/v1",
             temperature=0.0,
             max_tokens=32768,
             timeout=120,
+            chat_template_kwargs=dict(
+                enable_thinking=False,
+            ),
         ),
     ),
 ]

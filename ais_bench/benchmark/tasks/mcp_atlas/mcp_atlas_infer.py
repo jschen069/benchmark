@@ -65,6 +65,7 @@ from ais_bench.benchmark.tasks.mcp_atlas.utils import (
     compact_messages,
     detect_tool_calls,
     get_retry_delay,
+    has_text_tool_calls,
     is_retryable_error,
     mcp_tool_to_tool_info,
     pruned_tool_call,
@@ -122,6 +123,22 @@ class MCPAtlasInferTask(BaseTask):
             infer_cfg.get("tool_choice")
             or self.model_cfg.get("tool_choice", "auto")
         )
+
+        # Extra generation parameters (e.g., chat_template_kwargs for vLLM)
+        _KNOWN_INFER_KEYS = {
+            "temperature", "max_tokens", "timeout", "tool_choice",
+            "chat_template_kwargs",
+        }
+        self._infer_extra_params: Dict[str, Any] = {}
+        for key, value in infer_cfg.items():
+            if key not in _KNOWN_INFER_KEYS:
+                self._infer_extra_params[key] = value
+        # Always include chat_template_kwargs if present (vLLM needs it
+        # as a top-level key in the API payload)
+        if "chat_template_kwargs" in infer_cfg:
+            self._infer_extra_params["chat_template_kwargs"] = infer_cfg[
+                "chat_template_kwargs"
+            ]
 
         # Internal state
         self._client: Optional[MCPAtlasClient] = None
@@ -744,6 +761,10 @@ class MCPAtlasInferTask(BaseTask):
             payload["tools"] = tools
             payload["tool_choice"] = self._tool_choice
 
+        # Merge extra generation parameters (e.g., chat_template_kwargs)
+        if self._infer_extra_params:
+            payload.update(self._infer_extra_params)
+
         self.logger.info(
             "Calling model: url=%s, model=%s, messages=%d, tools=%d, "
             "temperature=%.2f, max_tokens=%d",
@@ -778,14 +799,38 @@ class MCPAtlasInferTask(BaseTask):
 
         usage = response_json.get("usage", {})
         choice = (response_json.get("choices") or [{}])[0]
+        message = choice.get("message", {})
+        finish_reason = choice.get("finish_reason", "unknown")
+
         self.logger.info(
             "Model response: finish_reason=%s, prompt_tokens=%s, "
             "completion_tokens=%s, total_tokens=%s",
-            choice.get("finish_reason", "unknown"),
+            finish_reason,
             usage.get("prompt_tokens", "N/A"),
             usage.get("completion_tokens", "N/A"),
             usage.get("total_tokens", "N/A"),
         )
+
+        # Warn if model returned text-format tool calls in content
+        # instead of structured tool_calls (common with some vLLM setups)
+        content = message.get("content", "")
+        structured_tc = message.get("tool_calls")
+        if (
+            not structured_tc
+            and finish_reason == "stop"
+            and content
+            and has_text_tool_calls(str(content))
+        ):
+            text_calls = detect_tool_calls(message)
+            self.logger.warning(
+                "Model returned text-format tool calls in content field "
+                "(%d detected) instead of structured tool_calls. "
+                "Ensure vLLM supports --enable-auto-tool-choice and "
+                "--tool-call-parser for your model, or verify that "
+                "chat_template_kwargs with enable_thinking=False is "
+                "being sent. Text tool calls will be used as fallback.",
+                len(text_calls),
+            )
 
         return response_json
 

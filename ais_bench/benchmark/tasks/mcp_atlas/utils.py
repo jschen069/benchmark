@@ -21,6 +21,7 @@ import os.path as osp
 import re
 import subprocess
 import sys
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -261,6 +262,89 @@ def pruned_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any
 
 
 # ---------------------------------------------------------------------------
+# Text-format tool call parsing (fallback for models that emit tool calls
+# as XML/text in the content field instead of structured tool_calls array)
+# ---------------------------------------------------------------------------
+
+# Regex pattern for qwen3.6-style XML tool calls:
+# <function=tool_name>\n<parameter=key>\nvalue\n</parameter>\n...\n</function>
+_TEXT_TOOL_CALL_RE = re.compile(
+    r"<function=([^>]+)>\s*\n(.*?)\n?</function>",
+    re.DOTALL,
+)
+_TEXT_PARAM_RE = re.compile(
+    r"<parameter=([^>]+)>\s*\n(.*?)\n?</parameter>",
+    re.DOTALL,
+)
+
+
+def parse_text_tool_calls(content: str) -> List[Dict[str, Any]]:
+    """Parse text-format tool calls from model content string.
+
+    Handles the qwen3.6 XML-style format::
+
+        <function=tool_name>
+        <parameter=key1>
+        value1
+        </parameter>
+        <parameter=key2>
+        value2
+        </parameter>
+        </function>
+
+    Each parsed tool call is returned in the same structure as
+    OpenAI structured ``tool_calls``, so the agent loop can process
+    them identically.
+
+    Args:
+        content: The model's text output containing tool calls.
+
+    Returns:
+        A list of tool call dicts with ``id``, ``type``, ``function``
+        keys.  Returns an empty list if no tool calls are found.
+    """
+    if not content or not isinstance(content, str):
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for match in _TEXT_TOOL_CALL_RE.finditer(content):
+        tool_name = match.group(1).strip()
+        body = match.group(2)
+
+        if not tool_name:
+            continue
+
+        # Extract parameters
+        params: Dict[str, str] = {}
+        for param_match in _TEXT_PARAM_RE.finditer(body):
+            param_name = param_match.group(1).strip()
+            param_value = param_match.group(2).strip()
+            if param_name:
+                params[param_name] = param_value
+
+        # Generate a unique ID for the text-based tool call
+        tc_id = f"text_tc_{uuid.uuid4().hex[:8]}"
+
+        results.append({
+            "id": tc_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(params, ensure_ascii=False) if params else "{}",
+            },
+        })
+
+    return results
+
+
+def has_text_tool_calls(content: str) -> bool:
+    """Quick check: does the text contain XML-style tool call markers?"""
+    if not content or not isinstance(content, str):
+        return False
+    return "<function=" in content and "</function>" in content
+
+
+# ---------------------------------------------------------------------------
 # Tool call detection (ported from mcp-atlas agent-eval.ts)
 # ---------------------------------------------------------------------------
 
@@ -289,7 +373,7 @@ def detect_tool_calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     tool_calls = message.get("tool_calls")
     if not tool_calls or not isinstance(tool_calls, list):
-        return []
+        tool_calls = []
 
     validated: List[Dict[str, Any]] = []
     for tc in tool_calls:
@@ -312,6 +396,14 @@ def detect_tool_calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "arguments": str(arguments) if arguments else "{}",
             },
         })
+
+    # Fallback: if no structured tool_calls found, try parsing text-format
+    # tool calls from the content field (e.g., qwen3.6 XML-style calls)
+    if not validated:
+        content = message.get("content", "")
+        if content and has_text_tool_calls(str(content)):
+            validated = parse_text_tool_calls(str(content))
+
     return validated
 
 
@@ -726,6 +818,24 @@ def _parse_claim_judge_response(response: Any) -> Tuple[str, str, float]:
             outcome = "not_fulfilled"
         return outcome, justification, confidence
     except Exception:
+        # Fallback: try to extract the last JSON object from mixed-format
+        # responses (e.g., chain-of-thought text followed by JSON block)
+        parsed = _extract_last_json_object(text)
+        if parsed is not None:
+            outcome = str(
+                parsed.get("coverage_outcome")
+                or parsed.get("outcome")
+                or "not_fulfilled"
+            )
+            justification = str(
+                parsed.get("justification") or parsed.get("reason") or ""
+            )
+            confidence = _parse_confidence(
+                parsed.get("confidence_level", parsed.get("confidence", 0.0))
+            )
+            if outcome not in ("fulfilled", "partially_fulfilled", "not_fulfilled"):
+                outcome = "not_fulfilled"
+            return outcome, justification, confidence
         lowered = text.lower()
         for outcome in ["partially_fulfilled", "not_fulfilled", "fulfilled"]:
             if outcome in lowered:
@@ -741,6 +851,59 @@ def _strip_json_fence(text: str) -> str:
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _extract_last_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the last JSON object from a mixed-format text response.
+
+    LLM judge models (especially when ``enable_thinking=True``) may produce
+    chain-of-thought reasoning followed by a JSON block.  This function
+    finds the last ``{...}``-like structure and attempts to parse it as
+    JSON.
+
+    Args:
+        text: The raw judge response text.
+
+    Returns:
+        A parsed dict if a valid JSON object is found, else ``None``.
+    """
+    if not text:
+        return None
+    # Find all top-level { ... } blocks by tracking brace depth
+    candidates: List[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidates.append(text[start:i + 1])
+    # Try parsing candidates from last to first
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
 
 
 def _parse_confidence(value: Any) -> float:

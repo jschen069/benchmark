@@ -102,6 +102,20 @@ class MCPAtlasEvalTask(BaseTask):
         self._judge_max_tokens = int(judge_cfg.get("max_tokens", 512))
         self._judge_timeout = int(judge_cfg.get("timeout", 120))
 
+        # Extra generation parameters for judge model (e.g., chat_template_kwargs)
+        _KNOWN_JUDGE_KEYS = {
+            "model", "api_url", "api_key", "temperature", "max_tokens",
+            "timeout", "chat_template_kwargs",
+        }
+        self._judge_extra_params: Dict[str, Any] = {}
+        for key, value in judge_cfg.items():
+            if key not in _KNOWN_JUDGE_KEYS:
+                self._judge_extra_params[key] = value
+        if "chat_template_kwargs" in judge_cfg:
+            self._judge_extra_params["chat_template_kwargs"] = judge_cfg[
+                "chat_template_kwargs"
+            ]
+
         self.logger.info(
             "MCPAtlasEvalTask initialized: pass_threshold=%.2f, "
             "use_structured_output=%s, "
@@ -505,6 +519,10 @@ class MCPAtlasEvalTask(BaseTask):
             self.logger.info(
                 "[Judge] Using structured output (json_schema)"
             )
+
+        # Merge extra generation parameters (e.g., chat_template_kwargs)
+        if self._judge_extra_params:
+            payload.update(self._judge_extra_params)
 
         self.logger.info(
             "[Judge] Calling judge API: url=%s, model=%s, prompt_len=%d, "
