@@ -12,6 +12,7 @@ class ErrorModule(Enum):
     TASK_EVALUATE = "TEVAL"                      # evaluate Task
     SWEBENCH = "SWEB"                            # swebench task/dataset
     SWEBENCH_PRO = "SWEBP"                       # swebench_pro task/dataset
+    MCPATLAS = "MCPA"                            # mcp_atlas task/dataset
     TASK_MONITOR = "TMON"                        # TaskMonitor
     TASK_STATUS_MANAGER = "TSMAN"                # TaskStateManager
     ICL_INFERENCER = "ICLI"                      # icl_inferencer
@@ -188,6 +189,23 @@ class SWEBP_CODES:
     HARNESS_RUNTIME_FAILED = BaseErrorCode("SWEBP-RUNTIME-002", ErrorModule.SWEBENCH_PRO, ErrorType.RUNTIME, 2, "SWE-bench Pro harness runtime failed")
 
 
+class MCP_CODES:
+    UNKNOWN_ERROR = BaseErrorCode("MCPA-UNK-001", ErrorModule.MCPATLAS, ErrorType.UNKNOWN, 1, "unknown error of mcp_atlas workflow")
+
+    AGENT_ENV_UNAVAILABLE = BaseErrorCode("MCPA-RUNTIME-001", ErrorModule.MCPATLAS, ErrorType.RUNTIME, 1, "agent-environment Docker service is not reachable")
+    TOOL_CATALOGUE_FAILED = BaseErrorCode("MCPA-RUNTIME-002", ErrorModule.MCPATLAS, ErrorType.RUNTIME, 2, "failed to fetch tool catalogue from agent-environment")
+
+    JUDGE_API_FAILED = BaseErrorCode("MCPA-RUNTIME-003", ErrorModule.MCPATLAS, ErrorType.RUNTIME, 3, "LLM judge API call failed after all retries")
+    INFERENCE_API_FAILED = BaseErrorCode("MCPA-RUNTIME-004", ErrorModule.MCPATLAS, ErrorType.RUNTIME, 4, "LLM inference API call failed after all retries")
+
+    PREDICTIONS_FILE_NOT_FOUND = BaseErrorCode("MCPA-FILE-001", ErrorModule.MCPATLAS, ErrorType.FILE, 1, "predictions file not found for mcp_atlas evaluation")
+    LOCAL_PARQUET_NOT_FOUND = BaseErrorCode("MCPA-FILE-002", ErrorModule.MCPATLAS, ErrorType.FILE, 2, "local MCP-Atlas parquet file not found")
+    LOCAL_PARQUET_LOAD_FAILED = BaseErrorCode("MCPA-FILE-003", ErrorModule.MCPATLAS, ErrorType.FILE, 3, "failed to load local MCP-Atlas parquet dataset")
+
+    MODEL_NOT_SET = BaseErrorCode("MCPA-PARAM-001", ErrorModule.MCPATLAS, ErrorType.PARAM, 1, "model is not configured for mcp_atlas inference")
+    API_URL_NOT_SET = BaseErrorCode("MCPA-PARAM-002", ErrorModule.MCPATLAS, ErrorType.PARAM, 2, "API URL is not configured for mcp_atlas inference")
+
+
 class ICLI_CODES:
     UNKNOWN_ERROR = BaseErrorCode("ICLI-UNK-001", ErrorModule.ICL_INFERENCER, ErrorType.UNKNOWN, 1, "unknown error of icl inferencer")
     INVALID_PARAM_VALUE = BaseErrorCode("ICLI-PARAM-001", ErrorModule.ICL_INFERENCER, ErrorType.PARAM, 1, "invalid parameter value") # docs coverd
@@ -340,6 +358,7 @@ ERROR_CODES_CLASSES = [
     TEVAL_CODES,
     SWEB_CODES,
     SWEBP_CODES,
+    MCP_CODES,
     ICLI_CODES,
     ICLE_CODES,
     ICLR_CODES,

@@ -475,7 +475,14 @@ class MCPAtlasEvalTask(BaseTask):
 
         Ported from mcp-atlas score_claims.py ``AsyncLiteLLMClient``.
         Supports optional structured JSON output via ``response_format``.
+
+        Retries on transient errors (500, 502, 503, 429, timeout) up to
+        ``MAX_JUDGE_RETRIES`` times with exponential backoff, matching the
+        upstream mcp-atlas retry behaviour.
         """
+        MAX_JUDGE_RETRIES = 5
+        JUDGE_RETRY_BASE_DELAY = 10.0  # seconds
+
         url = self._judge_api_url or self.model_cfg.get(
             "api_url", self.model_cfg.get("url", ""),
         )
@@ -531,37 +538,66 @@ class MCPAtlasEvalTask(BaseTask):
             self._judge_temperature, self._judge_max_tokens,
         )
 
-        resp = requests.post(
-            f'{url.rstrip("/")}/chat/completions',
-            headers=headers,
-            json=payload,
-            timeout=self._judge_timeout,
-        )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            self.logger.error(
-                "[Judge] API request failed: status=%s, body=%s",
-                resp.status_code,
-                resp.text[:4000],
-            )
-            raise exc
-        data = resp.json()
-        choice = (data.get("choices") or [{}])[0]
-        result = str(choice.get("message", {}).get("content", "") or "")
+        last_error: Optional[Exception] = None
+        for attempt in range(MAX_JUDGE_RETRIES):
+            try:
+                resp = requests.post(
+                    f'{url.rstrip("/")}/chat/completions',
+                    headers=headers,
+                    json=payload,
+                    timeout=self._judge_timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                choice = (data.get("choices") or [{}])[0]
+                result = str(choice.get("message", {}).get("content", "") or "")
 
-        usage = data.get("usage", {})
-        self.logger.info(
-            "[Judge] API response: result_len=%d, finish_reason=%s, "
-            "prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
-            len(result),
-            choice.get("finish_reason", "unknown"),
-            usage.get("prompt_tokens", "N/A"),
-            usage.get("completion_tokens", "N/A"),
-            usage.get("total_tokens", "N/A"),
-        )
+                usage = data.get("usage", {})
+                self.logger.info(
+                    "[Judge] API response: result_len=%d, finish_reason=%s, "
+                    "prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
+                    len(result),
+                    choice.get("finish_reason", "unknown"),
+                    usage.get("prompt_tokens", "N/A"),
+                    usage.get("completion_tokens", "N/A"),
+                    usage.get("total_tokens", "N/A"),
+                )
 
-        return result
+                return result
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response is not None else None
+                self.logger.error(
+                    "[Judge] API request failed (attempt %d/%d): status=%s, body=%s",
+                    attempt + 1, MAX_JUDGE_RETRIES,
+                    status_code,
+                    exc.response.text[:2000] if exc.response is not None else "N/A",
+                )
+                if status_code in (429, 500, 502, 503) and attempt < MAX_JUDGE_RETRIES - 1:
+                    delay = min(2 ** attempt * JUDGE_RETRY_BASE_DELAY, 120)
+                    self.logger.warning(
+                        "[Judge] Retrying in %.1fs...", delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = exc
+                self.logger.error(
+                    "[Judge] API request failed (attempt %d/%d): %s",
+                    attempt + 1, MAX_JUDGE_RETRIES, exc,
+                )
+                if attempt < MAX_JUDGE_RETRIES - 1:
+                    delay = min(2 ** attempt * JUDGE_RETRY_BASE_DELAY, 120)
+                    self.logger.warning(
+                        "[Judge] Retrying in %.1fs...", delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+
+        # Should not reach here, but just in case
+        raise last_error  # type: ignore
 
     # -- results -----------------------------------------------------------
 
@@ -705,6 +741,10 @@ if __name__ == "__main__":
     try:
         task = MCPAtlasEvalTask(cfg)
         task.run(task_state_manager)
+    except KeyboardInterrupt:
+        task_state_manager.update_task_state({"status": "cancelled"})
+        logger.info("MCP-Atlas evaluation interrupted by user")
+        os._exit(130)
     except Exception:
         task_state_manager.update_task_state({"status": "error"})
         raise

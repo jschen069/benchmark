@@ -246,6 +246,37 @@ class MCPAtlasInferTask(BaseTask):
             self.logger.info("Applying sample limit: %d -> %d", len(data), min(len(data), limit))
             data = data[:limit]
 
+        # Resume: skip already-completed task_ids (matching swebench pattern)
+        pred_path = get_infer_output_path(
+            self.model_cfg,
+            dataset_cfg,
+            osp.join(self.work_dir, self.output_subdir),
+            file_extension="json",
+        )
+        existing_preds: Dict[str, Any] = {}
+        if osp.isfile(pred_path):
+            try:
+                with open(pred_path, encoding="utf-8") as f:
+                    existing_preds = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                self.logger.warning(
+                    "Failed to parse existing predictions at %s, starting fresh.",
+                    pred_path,
+                )
+        existing_ids = set(existing_preds.keys())
+        if existing_ids:
+            original_count = len(data)
+            data = [
+                s for s in data
+                if str(_field(s, "TASK", "task", "task_id")) not in existing_ids
+            ]
+            skipped = original_count - len(data)
+            self.logger.info(
+                "Resume: %d task(s) already done, %d remaining",
+                skipped,
+                len(data),
+            )
+
         if not data:
             self.logger.warning("No samples to run inference on.")
             self._save_predictions({})
@@ -516,12 +547,12 @@ class MCPAtlasInferTask(BaseTask):
                 task_id,
                 step + 1,
                 len(messages_to_send),
-                len(tools) if step == 0 else 0,
+                len(tools),
             )
 
             # Call LLM with retry logic (ported from mcp-atlas)
             response = self._call_model_with_retry(
-                messages_to_send, tools if step == 0 else [], task_id, step,
+                messages_to_send, tools, task_id, step,
             )
 
             choice = (response.get("choices") or [{}])[0]
@@ -898,6 +929,10 @@ if __name__ == "__main__":
     try:
         task = MCPAtlasInferTask(cfg)
         task.run(task_state_manager)
+    except KeyboardInterrupt:
+        task_state_manager.update_task_state({"status": "cancelled"})
+        logger.info("MCP-Atlas inference interrupted by user")
+        os._exit(130)
     except Exception:
         task_state_manager.update_task_state({"status": "error"})
         raise
