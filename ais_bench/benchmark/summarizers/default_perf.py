@@ -152,11 +152,16 @@ class DefaultPerfSummarizer:
                 manager_list.append({"success": False})
                 continue
             if perf_data.get("input_tokens") is not None and perf_data.get("input_tokens") > 0:
-                pass # Prefer service-returned "prompt_tokens".
+                input_tokens_source = "service-returned prompt_tokens" # Prefer service-returned "prompt_tokens".
             elif is_mm_prompt(perf_data["input"]):
                 perf_data["input_tokens"] = 0  # multi-modal input does not support input_tokens
+                input_tokens_source = "multimodal input, set to 0"
             elif "input_tokens" not in perf_data or perf_data.get("input_tokens") is None:
                 perf_data["input_tokens"] = len(tokenizer.encode(perf_data["input"])) # input_tokens is not provided, calculate it
+                input_tokens_source = "local tokenizer encode"
+            else:
+                input_tokens_source = "existing value kept as-is"
+            self.logger.info(f"[InputTokens] uuid={perf_data.get('uuid')}: input_tokens={perf_data['input_tokens']} (source: {input_tokens_source})")
 
             if "output_tokens" not in perf_data or perf_data.get("output_tokens") is None:
                 perf_data["output_tokens"] = len(tokenizer.encode(perf_data["prediction"]))
@@ -327,6 +332,7 @@ class DefaultPerfSummarizer:
                     osp.join(output_filepath, dataset + ".json"),
                 )
                 calc.save_performance(osp.join(output_filepath, dataset + ".csv"))
+                self.logger.info(f"[InputTokens] Final result of {model}/{dataset}: stats={calc.metrics.get('InputTokens')}, total={calc.common_metrics.get('Total Input Tokens')}")
 
     def _pick_up_results(self):
         """Pick up performance results from files.

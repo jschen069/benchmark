@@ -141,6 +141,7 @@ class VLLMCustomAPI(BaseAPIModel):
         if json_content.get("usage"):
             output.input_tokens = json_content["usage"].get("prompt_tokens", 0)
             output.output_tokens = json_content["usage"].get("completion_tokens", 0)
+            self.logger.info(f"[InputTokens] Got input_tokens={output.input_tokens}, output_tokens={output.output_tokens} from service usage, uuid={output.uuid}")
 
     async def _parse_logprobs(self, choice: dict, output: Output) -> None:
         # completions API 格式：并行数组 {tokens, token_logprobs, top_logprobs}

@@ -490,7 +490,7 @@ class BasePerfMetricCalculator(ABC):
             self.common_metrics["Total Input Tokens"][stage_name] = sum(
                 self.result[stage_name]["InputTokens"]
             )
-            self.logger.debug(f"Stage {stage_name} - Total Input Tokens: {self.common_metrics['Total Input Tokens'][stage_name]}")
+            self.logger.info(f"[InputTokens] Stage {stage_name}: Total Input Tokens = {self.common_metrics['Total Input Tokens'][stage_name]}")
 
             self.common_metrics["Total Generated Tokens"][stage_name] = sum(
                 self.result[stage_name]["OutputTokens"]
