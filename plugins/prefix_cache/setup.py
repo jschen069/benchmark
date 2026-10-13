@@ -12,7 +12,7 @@ setup(
         "aiohttp",
         "datasets>=2.12.0,<=3.6.0",
         "Pillow",
-        "pyarrow",
+        "pyarrow==25.0.1",
         "transformers",
     ],
     entry_points={
