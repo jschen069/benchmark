@@ -65,7 +65,7 @@ def weight_fingerprints(dimensions, cache):
     return found, missing
 
 
-def preflight(source_root, cache, dimensions):
+def preflight(source_root, cache, dimensions, strict=False):
     root = Path(source_root).resolve()
     missing = [p for p in required_paths(dimensions, cache) if not Path(p).exists()]
     if 'first_dnsmos' in dimensions:
@@ -81,4 +81,45 @@ def preflight(source_root, cache, dimensions):
         path = root / 'vabench' / f'{dimension}.py'
         if not path.is_file():
             missing.append(str(path))
-    return missing
+    if strict:
+        # Empty checkpoint directories must not pass the installation audit.
+        from .data import read_json
+        folders = []
+        if 'second_clap' in dimensions:
+            folders.append(Path(cache) / 'clap/laion__clap-htsat-unfused')
+        if any(d.startswith(('third_', 'fourth_')) for d in dimensions):
+            folders.append(Path(cache) / 'Qwen2.5_omni_7B')
+        for folder in folders:
+            for name in ('config.json', 'tokenizer_config.json'):
+                if not (folder / name).is_file():
+                    missing.append(str(folder / name))
+            weights = list(folder.glob('*.safetensors')) + list(folder.glob('pytorch_model*.bin'))
+            indices = list(folder.glob('*.index.json'))
+            if not weights:
+                missing.append(str(folder / '<model weights>'))
+            if any('-of-' in p.name for p in weights) and not indices:
+                missing.append(str(folder / '<sharded model weight index>'))
+            for weight in weights:
+                if weight.stat().st_size == 0:
+                    missing.append(str(weight) + ' (empty file)')
+            for index in indices:
+                try:
+                    shards = set(read_json(index)['weight_map'].values())
+                    if not shards:
+                        raise ValueError('empty weight map')
+                    for shard in shards:
+                        target = folder / shard
+                        if not target.resolve().is_relative_to(folder.resolve()) or not target.is_file():
+                            missing.append(str(target))
+                except (ValueError, KeyError, TypeError):
+                    missing.append(str(index) + ' (invalid weight index)')
+        if 'second_lsa' in dimensions:
+            folder = Path(cache) / 'checkpoints/auxiliary/models/buffalo_l'
+            for name in ('det_10g.onnx', '2d106det.onnx'):
+                if not (folder / name).is_file():
+                    missing.append(str(folder / name))
+        for name in required_paths(dimensions, cache):
+            path = Path(name)
+            if path.is_file() and path.stat().st_size == 0:
+                missing.append(name + ' (empty file)')
+    return sorted(set(missing))

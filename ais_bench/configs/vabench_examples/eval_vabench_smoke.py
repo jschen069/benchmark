@@ -1,6 +1,6 @@
 """One pinned T2AV sample, one CLAP metric. Prepare with --subset smoke first.
 
-Edit paths for the A3 server. This is a plumbing smoke test, not Mini10/778.
+Edit paths for the GPU server. This is a plumbing smoke test, not Mini10/778.
 """
 from ais_bench.benchmark.datasets.vabench import VABenchDataset
 from ais_bench.benchmark.partitioners import NaivePartitioner
@@ -11,7 +11,7 @@ from ais_bench.benchmark.summarizers import VABenchSummarizer
 PREPARED_DIR = ''
 SOURCE_ROOT = ''
 CACHE_DIR = ''
-DEVICE = 'npu:0'
+DEVICE = 'cuda:0'
 BACKEND_PYTHON = None
 
 models = [dict(attr='local', type='VABenchEvalPlaceholder', abbr='doubao_kitten_smoke')]

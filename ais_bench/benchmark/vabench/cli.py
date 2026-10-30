@@ -1,6 +1,6 @@
 """Lightweight preparation, runtime diagnostics, evaluation and comparison.
 
-Usage: python -m ais_bench.benchmark.vabench.cli --help
+Usage: python3 -m ais_bench.benchmark.vabench.cli --help
 """
 import argparse
 import importlib.util
@@ -13,10 +13,10 @@ import subprocess
 import sys
 
 from . import DIMENSIONS
-from .data import PROTOCOL_PATH, catalog, media_tool, prepare, read_json, write_json
+from .data import PROTOCOL_PATH, catalog, digest, media_tool, prepare, read_json, write_json
 from .engine import run, successful
 from .resources import preflight
-from .results import compare
+from .results import compare, export_csv, format_summary, refresh_report
 
 
 def main(argv=None):
@@ -49,6 +49,9 @@ def main(argv=None):
     cmp.add_argument('--relative', type=float, default=0.01)
     cmp.add_argument('--near-zero', type=float, default=1e-6)
     cmp.add_argument('--absolute', type=float, default=1e-6)
+    summary = commands.add_parser('summarize', help='Reaggregate an AISBench per-sample report without model inference')
+    summary.add_argument('--report', required=True)
+    summary.add_argument('--output', required=True, help='New output directory; original report is retained')
     args = parser.parse_args(argv)
     if args.command == 'catalog':
         entries = catalog(args.source_root, args.subset, sample_id=args.sample_id)
@@ -101,8 +104,22 @@ def main(argv=None):
             parser.error(f'Unknown options: {set(options) - allowed}')
         result = run(args.prepared, args.source_root, args.cache_dir, args.output,
                      args.dimensions, device=args.device, python=args.python, mode=args.mode, **options)
+        print(format_summary(result))
         print(f'Report: {Path(args.output).resolve() / "report.json"}')
         return int(not successful(result))
+    elif args.command == 'summarize':
+        destination = Path(args.output).resolve()
+        if destination.exists() and any(destination.iterdir()):
+            raise FileExistsError(f'Choose a new summary directory: {destination}')
+        result = refresh_report(read_json(args.report))
+        result['postprocessing'] = dict(source_report=str(Path(args.report).resolve()),
+                                        source_report_sha256=digest(args.report), model_inference_rerun=False)
+        destination.mkdir(parents=True, exist_ok=True)
+        write_json(destination / 'report.json', result)
+        export_csv(result, destination)
+        print(format_summary(result))
+        print(f'Report: {destination / "report.json"}')
+        return 0
     else:
         result = compare(read_json(args.reference), read_json(args.candidate),
                          args.dimensions, args.relative, args.near_zero, args.absolute)

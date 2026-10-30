@@ -43,7 +43,7 @@ def test_task_preserves_incomplete_report(tmp_path, monkeypatch):
     assert (tmp_path / 'results/test/vabench.json').exists()
 
 
-def test_native_summary_without_total(tmp_path):
+def test_native_summary_with_normalization_and_unavailable_total(tmp_path):
     cfg = ConfigDict(models=[dict(abbr='test')],
                      datasets=[dict(abbr='vabench', path='prepared')], work_dir=str(tmp_path))
     write_json(tmp_path / 'results/test/vabench.json', dict(
@@ -54,11 +54,14 @@ def test_native_summary_without_total(tmp_path):
     raw, parsed, metrics, modes = summarizer._pick_up_results()
     assert parsed['test']['vabench/second_desync']['mean'] == 0.2
     assert raw['test']['vabench/second_desync']['direction'] == 'lower'
-    assert not any('total' in key for key in parsed['test'])
+    assert parsed['test']['vabench/second_desync']['normalized_score'] == 90
+    assert parsed['test']['vabench/total']['normalized_score'] == '—'
+    assert len(parsed['test']) == 16
     table = summarizer._format_table(parsed, metrics, modes,
                                      required_dataset_abbrs=summarizer.dataset_abbrs)
     assert table
-    assert table[1][2] == 'lower'
+    row = next(r for r in table if len(r) > 1 and r[1] == 'vabench/second_desync')
+    assert row[2] == 'lower'
     # A failed dimension has an explicit N/A mean, never a fabricated zero.
     file = tmp_path / 'results/test/vabench.json'
     from ais_bench.benchmark.vabench.data import read_json
@@ -67,4 +70,5 @@ def test_native_summary_without_total(tmp_path):
     write_json(file, report)
     raw, parsed, metrics, modes = summarizer._pick_up_results()
     table = summarizer._format_table(parsed, metrics, modes)
-    assert table[1][3] == 'N/A' and table[1][-1] == 'incomplete'
+    row = next(r for r in table if len(r) > 1 and r[1] == 'vabench/second_desync')
+    assert row[3] == '—' and row[-1] == 'incomplete'

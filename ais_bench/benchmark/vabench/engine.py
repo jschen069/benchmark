@@ -102,15 +102,20 @@ def run(prepared, source_root, cache_dir, output, dimensions=None, device='cuda:
             for dim in dims:
                 results[dim] = response['details'][dim]
             provenance['environments'].append(response.get('environment', {}))
-        report = build_report(manifest, results, provenance)
+        report = build_report(manifest, results, provenance, requested_dimensions=dimensions)
         write_json(output / 'partial_report.json', report)
-    report = build_report(manifest, results, provenance)
+    report = build_report(manifest, results, provenance, requested_dimensions=dimensions)
     write_json(output / 'report.json', report)
     export_csv(report, output)
     return report
 
 
 def successful(report):
-    return bool(report['metrics']) and all(m['scored'] > 0 and not m['failed'] and
-               (not m['missing'] or d == 'second_lsa')
-               for d, m in report['metrics'].items())
+    # A selected single-metric smoke run may succeed without a 15-metric total.
+    # LSA omissions nevertheless make the selected evaluation incomplete.
+    selected = report.get('requested_dimensions', list(report.get('details', {})) or list(report['metrics']))
+    return bool(selected) and all(
+        (m := report['metrics'].get(d, {})).get('scored', 0) > 0
+        and not m.get('failed') and not m.get('missing') and not m.get('not_evaluated')
+        and m.get('status', 'complete') == 'complete'
+        and m.get('expected', m['scored']) == m['scored'] for d in selected)

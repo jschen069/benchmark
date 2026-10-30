@@ -235,11 +235,12 @@ def test_real_worker_subprocess_and_mllm_grouping(tmp_path, entry, video, monkey
         'def get_omni_model_and_processor(*a, **kw): raise RuntimeError("unused")\n', encoding='utf-8')
     dims = ['third_alignment', 'fourth_qa_audio']
     for dim in dims:
+        fixture_score = 1.0 if dim.startswith('fourth_') else 3.0
         (package / f'{dim}.py').write_text(
             'import json\n'
             f'def compute_{dim}(file, device, submodules, **kw):\n'
             '    items = json.load(open(file, encoding="utf-8"))\n'
-            '    return None, [{"video_path": x["video_list"][0], "video_results": 3.0} for x in items]\n',
+            f'    return None, [{{"video_path": x["video_list"][0], "video_results": {fixture_score}}} for x in items]\n',
             encoding='utf-8')
     cache = tmp_path / 'cache'
     checkpoint = cache / 'Qwen2.5_omni_7B'

@@ -12,8 +12,8 @@ from ais_bench.benchmark.summarizers import VABenchSummarizer
 PREPARED_DIR = ''
 SOURCE_ROOT = ''
 CACHE_DIR = ''
-DEVICE = 'npu:0'
-BACKEND_PYTHON = None  # e.g. '/opt/venvs/vabench/bin/python'
+DEVICE = 'cuda:0'
+BACKEND_PYTHON = None  # e.g. '/root/miniconda3/envs/vabench311/bin/python3'
 NUM_DEVICES = 1  # number reserved by LocalRunner; GPU Omni may require more
 
 models = [dict(attr='local', type='VABenchEvalPlaceholder', abbr='generated_t2av')]

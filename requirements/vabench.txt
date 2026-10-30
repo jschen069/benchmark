@@ -1,34 +1,5 @@
-# Install into a separate Python 3.11 environment AFTER selecting a compatible
-# torch/torchvision/torchaudio (+torch_npu on Ascend) and CANN combination.
-# Deliberately no torch, CUDA runtime, triton or onnxruntime-gpu pins here.
-transformers==4.57.0
-accelerate==1.10.1
-qwen-omni-utils==0.0.8
-numpy==1.26.4
-nisqa==2.0.post2
-audiobox-aesthetics==0.0.4
-onnxruntime>=1.20,<2
-decord==0.6.0
-librosa==0.10.1
-soundfile==0.13.1
-omegaconf==2.3.0
-easydict
-ftfy
-regex
-gdown
-einops
-timm==1.0.20
-opencv-python-headless
-insightface==0.7.3
-scenedetect==0.6.7.1
-python-speech-features
-matplotlib
-imageio
-torchlibrosa
-pytorchvideo==0.1.5
-fvcore
-iopath
-webdataset
-braceexpand
-# Install OpenAI CLIP and ImageBind from their official repositories separately.
-# Follow the Synchformer dependency file for additional imports it requires.
+# Backwards-compatible entry for the GPU scoring backend's PyPI dependencies.
+# Complete install (including NISQA and pinned Git packages):
+# python3 -m ais_bench.benchmark.vabench.environment install --help
+# Run in a separate Conda Python 3.11 environment, not AISBench's main environment.
+-r datasets/vabench.txt
